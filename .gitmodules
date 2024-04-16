@@ -1,0 +1,3 @@
+[submodule "plane-std/component/esp32-camera"]
+	path = plane-std/component/esp32-camera
+	url = https://github.com/espressif/esp32-camera
