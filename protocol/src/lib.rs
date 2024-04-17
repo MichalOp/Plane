@@ -2,6 +2,14 @@ use bytemuck::{Pod, Zeroable};
 
 const PACKET_LEN: u32 = 496;
 
+#[derive(Clone, Copy, Zeroable, Pod, Debug)]
+#[repr(C)]
+pub struct Control {
+    pub roll: f32,
+    pub pitch: f32,
+    pub throttle: f32,
+}
+
 /// The packet messaging protocol.
 /// It is assumed that life is hard but not too hard. More precisely:
 /// - Packets might be randomly missing, but that is rare.

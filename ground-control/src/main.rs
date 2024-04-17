@@ -1,39 +1,40 @@
 use std::{
-    io::Cursor,
-    net::UdpSocket,
+    net::SocketAddr,
     sync::{Arc, Mutex},
     thread,
+    time::Duration,
 };
 
 use anyhow;
-use bytemuck;
+use bytemuck::{bytes_of, Zeroable};
 use eframe::egui;
 use egui::{Color32, TextureHandle};
-use image::{io::Reader as ImageReader, GenericImageView};
-use protocol::{self, Packet, Packets, ParseError};
+use protocol::Control;
+use stick::{Controller, Event, Listener};
+use tokio::net::UdpSocket;
+use tokio::time;
 use tracing::{info, warn};
 use turbojpeg;
 
-fn server_simple(buffer: Arc<Mutex<egui::ImageData>>) -> anyhow::Result<()> {
-    let socket = UdpSocket::bind("0.0.0.0:12892").unwrap();
+async fn video_server(
+    socket: Arc<UdpSocket>,
+    buffer: Arc<Mutex<egui::ImageData>>,
+    plane_ip: Arc<Mutex<Option<SocketAddr>>>,
+) -> anyhow::Result<()> {
     // Receives a single datagram message on the socket. If `buf` is too small to hold
     // the message, it will be cut off.
     loop {
         let mut buf = [0; 65536];
-        let (amt, _src) = socket.recv_from(&mut buf).unwrap();
+        let (amt, src) = socket.recv_from(&mut buf).await.unwrap();
+        *plane_ip.lock().unwrap() = Some(src);
         if amt > 0 {
             // info!("Parsing! {}", payload.len());
-
             let img: Result<image::RgbImage, _> = turbojpeg::decompress_image(&buf);
-
             if img.is_err() {
                 warn!("eh {}", img.err().unwrap());
                 continue;
             }
             let img = img.unwrap();
-
-            // info!("Parsed!");
-
             let mut locked = buffer.lock().unwrap();
             *locked = egui::ImageData::Color(
                 egui::ColorImage {
@@ -49,50 +50,66 @@ fn server_simple(buffer: Arc<Mutex<egui::ImageData>>) -> anyhow::Result<()> {
     }
 }
 
-fn server(buffer: Arc<Mutex<egui::ImageData>>) -> anyhow::Result<()> {
-    let socket = UdpSocket::bind("0.0.0.0:12892").unwrap();
-    // Receives a single datagram message on the socket. If `buf` is too small to hold
-    // the message, it will be cut off.
-
-    let mut packets = Packets(Vec::new());
-
+async fn track_events(controller: Controller, control: Arc<Mutex<Control>>) {
+    let mut controller = controller;
     loop {
-        let mut to_receive = Packet::new();
-        let buf = bytemuck::bytes_of_mut(&mut to_receive);
-        let (amt, _src) = socket.recv_from(buf).unwrap();
-        packets.0.push(to_receive);
-        match packets.parse_and_clear() {
-            Ok(payload) => {
-                // info!("Parsing! {}", payload.len());
-
-                let img: Result<image::RgbImage, _> = turbojpeg::decompress_image(&payload);
-
-                if img.is_err() {
-                    warn!("eh {}", img.err().unwrap());
-                    continue;
-                }
-                let img = img.unwrap();
-
-                // info!("Parsed!");
-
-                let mut locked = buffer.lock().unwrap();
-                *locked = egui::ImageData::Color(
-                    egui::ColorImage {
-                        size: [img.width() as usize, img.height() as usize],
-                        pixels: img
-                            .pixels()
-                            .map(|x| Color32::from_rgb(x.0[0], x.0[1], x.0[2]))
-                            .collect(),
-                    }
-                    .into(),
-                )
+        let event = (&mut controller).await;
+        match event {
+            Event::JoyX(x) => {
+                // info!("roll {}", x);
+                control.lock().unwrap().roll = x as f32;
             }
-            Err(ParseError::DroppedPacket(x)) => {
-                warn!("Message {} dropped!", x)
+            Event::JoyY(y) => {
+                // info!("pitch {}", y);
+                control.lock().unwrap().pitch = y as f32;
             }
-            Err(ParseError::NoFullMessage) => {
-                // info!("No full message")
+            Event::Throttle(t) => {
+                // info!("throttle {}", t);
+                control.lock().unwrap().throttle = t as f32;
             }
+            _ => {}
+        }
+    }
+}
+
+async fn send_command(
+    socket: Arc<UdpSocket>,
+    control: Arc<Mutex<Control>>,
+    plane_ip: Arc<Mutex<Option<SocketAddr>>>,
+) -> anyhow::Result<()> {
+    let mut interval = time::interval(Duration::from_millis(10));
+    loop {
+        interval.tick().await;
+        let ip = plane_ip.lock().unwrap().clone();
+        if let Some(ip) = ip {
+            let bytes_to_send: Vec<u8> = {
+                let lock = control.lock().unwrap();
+                bytes_of(&*lock).to_vec()
+            };
+            socket.send_to(&bytes_to_send, ip).await?;
+        }
+    }
+}
+
+async fn tokio_main(buffer: Arc<Mutex<egui::ImageData>>) -> anyhow::Result<()> {
+    let control = Arc::new(Mutex::new(Control::zeroed()));
+    let plane_ip: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:12892").await.unwrap());
+
+    {
+        let control = control.clone();
+        let plane_ip = plane_ip.clone();
+        let socket = socket.clone();
+        tokio::task::spawn(async move { send_command(socket, control, plane_ip).await });
+    }
+    tokio::task::spawn(async move { video_server(socket, buffer, plane_ip).await });
+    let mut listener = Listener::default();
+    loop {
+        let controller = (&mut listener).await;
+        println!("{:?}", controller);
+        if controller.name() == "Thrustmaster T.16000M" {
+            let control = control.clone();
+            tokio::task::spawn(async move { track_events(controller, control).await });
         }
     }
 }
@@ -115,18 +132,24 @@ fn main() {
     tracing::subscriber::set_global_default(tracing_subscriber::FmtSubscriber::new())
         .expect("setting tracing default failed");
     let buffer = Arc::new(Mutex::new(make_debug_image()));
-
     let buffer_cloned = buffer.clone();
-    let recv_server = thread::spawn(move || server_simple(buffer_cloned));
 
-    let mut native_options = eframe::NativeOptions::default();
+    let tokio_thread = thread::spawn(move || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move { tokio_main(buffer_cloned).await.unwrap() })
+    });
+
+    let native_options = eframe::NativeOptions::default();
     eframe::run_native(
         "My egui App",
         native_options,
         Box::new(|cc| Box::new(MyEguiApp::new(cc, buffer))),
     )
     .unwrap();
-    recv_server.join().unwrap().unwrap();
+    tokio_thread.join().unwrap();
 }
 
 struct MyEguiApp {
