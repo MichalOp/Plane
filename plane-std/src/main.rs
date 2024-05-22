@@ -21,7 +21,7 @@ use std::{
     net::{SocketAddr, UdpSocket},
     str::FromStr,
     sync::Arc,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 pub fn wifi(
@@ -98,25 +98,39 @@ fn command_thread(
     mut throttle: LedcDriver,
 ) -> Result<()> {
     println!("command thread started!");
+    socket
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     let min_duty = pitch.get_max_duty() * 1 / 20;
     let max_duty = pitch.get_max_duty() * 2 / 20;
     println!("{} {}", min_duty, max_duty);
+
     loop {
         let mut command = protocol::Control::zeroed();
         let buf = bytes_of_mut(&mut command);
-        let (amt, _src) = socket.recv_from(buf).unwrap();
-        if amt == buf.len() {
-            println!("command! {:?}", command);
+        let recv_value = socket.recv_from(buf);
+        let ok = match recv_value {
+            Ok((amt, _)) => amt == buf.len(),
+            _ => {
+                command = protocol::Control {
+                    pitch: 0.5,
+                    roll: 0.5,
+                    throttle: 0.0,
+                };
+                true
+            }
+        };
+        if ok {
             let pitch_value =
                 (((command.pitch + 1.0) / 2.0) * (max_duty - min_duty) as f32) as u32 + min_duty;
             let roll_value =
                 (((command.roll + 1.0) / 2.0) * (max_duty - min_duty) as f32) as u32 + min_duty;
             let throttle_value =
-                (((command.throttle + 1.0) / 2.0) * (max_duty - min_duty) as f32) as u32 + min_duty;
-            // println!("pitch value: {}", pitch_value);
-            pitch.set_duty(pitch_value).unwrap();
-            roll.set_duty(roll_value).unwrap();
-            throttle.set_duty(throttle_value).unwrap();
+                (command.throttle * (max_duty - min_duty) as f32) as u32 + min_duty;
+
+            pitch.set_duty(pitch_value).unwrap_or_default();
+            roll.set_duty(roll_value).unwrap_or_default();
+            throttle.set_duty(throttle_value).unwrap_or_default();
         }
     }
 }
@@ -242,8 +256,8 @@ fn main() -> Result<()> {
 
         let t3 = SystemTime::now();
 
-        avg_capture += t2.duration_since(t1).unwrap().as_secs_f32();
-        avg_send += t3.duration_since(t2).unwrap().as_secs_f32();
+        avg_capture += t2.duration_since(t1).unwrap_or_default().as_secs_f32();
+        avg_send += t3.duration_since(t2).unwrap_or_default().as_secs_f32();
         if message_id % 100 == 0 {
             let tnow = SystemTime::now();
             println!(
@@ -251,7 +265,7 @@ fn main() -> Result<()> {
                 message_id,
                 avg_capture / 100.0 * 1000.0,
                 avg_send / 100.0 * 1000.0,
-                100.0 / tnow.duration_since(tprev).unwrap().as_secs_f64(),
+                100.0 / tnow.duration_since(tprev).unwrap_or_default().as_secs_f64(),
             );
             tprev = tnow;
             avg_capture = 0.0;

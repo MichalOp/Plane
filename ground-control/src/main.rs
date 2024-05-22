@@ -9,6 +9,7 @@ use anyhow;
 use bytemuck::{bytes_of, Zeroable};
 use eframe::egui;
 use egui::{Color32, TextureHandle};
+use image::imageops::resize;
 use protocol::Control;
 use stick::{Controller, Event, Listener};
 use tokio::net::UdpSocket;
@@ -35,6 +36,12 @@ async fn video_server(
                 continue;
             }
             let img = img.unwrap();
+            // let img = resize(
+            //     &img,
+            //     img.width() * 2,
+            //     img.height() * 2,
+            //     image::imageops::FilterType::Nearest,
+            // );
             let mut locked = buffer.lock().unwrap();
             *locked = egui::ImageData::Color(
                 egui::ColorImage {
@@ -61,7 +68,7 @@ async fn track_events(controller: Controller, control: Arc<Mutex<Control>>) {
             }
             Event::JoyY(y) => {
                 // info!("pitch {}", y);
-                control.lock().unwrap().pitch = y as f32;
+                control.lock().unwrap().pitch = -y as f32;
             }
             Event::Throttle(t) => {
                 // info!("throttle {}", t);
@@ -181,7 +188,13 @@ impl eframe::App for MyEguiApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             let thing = self.image_buffer.lock().unwrap();
             self.texture.set(thing.clone(), Default::default());
-            ui.image(&self.texture);
+            ui.centered_and_justified(|ui| {
+                ui.add(
+                    egui::Image::new(&self.texture)
+                        .maintain_aspect_ratio(true)
+                        .fit_to_exact_size(ui.available_size()),
+                )
+            });
             ui.heading(format!("Hello World! {}", self.i));
             self.i += 1;
             ctx.request_repaint();
