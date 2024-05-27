@@ -2,6 +2,7 @@ use anyhow::{bail, ensure, Result};
 use bytemuck::{self, bytes_of_mut, Zeroable};
 use core::str;
 use esp_idf_hal::{
+    i2c::{I2cConfig, I2cDriver, I2C1},
     ledc::{LedcDriver, Resolution},
     prelude::*,
 };
@@ -16,6 +17,7 @@ use esp_idf_svc::{
 };
 use esp_idf_sys::{nvs_flash_init, ESP_OK};
 use log::info;
+use lsm6dso;
 use protocol;
 use std::{
     net::{SocketAddr, UdpSocket},
@@ -156,22 +158,42 @@ fn main() -> Result<()> {
     let driver_pitch = LedcDriver::new(
         peripherals.ledc.channel4,
         &timer_driver,
-        peripherals.pins.gpio13,
+        peripherals.pins.gpio2,
     )
     .unwrap();
     let driver_roll = LedcDriver::new(
         peripherals.ledc.channel5,
         &timer_driver,
-        peripherals.pins.gpio14,
+        peripherals.pins.gpio16,
     )
     .unwrap();
 
     let driver_throttle = LedcDriver::new(
         peripherals.ledc.channel6,
         &timer_driver,
-        peripherals.pins.gpio15,
+        peripherals.pins.gpio1,
     )
     .unwrap();
+    let sda = peripherals.pins.gpio15;
+    let scl = peripherals.pins.gpio7;
+
+    let config = I2cConfig::new().baudrate(100.kHz().into());
+    let i2cdriver = I2cDriver::new(peripherals.i2c0, sda, scl, &config).unwrap();
+
+    let mut driver = lsm6dso::Lsm6dso::new(i2cdriver, 0x6a).unwrap();
+    driver.set_low_power_mode(false).unwrap();
+    driver
+        .set_accelerometer_output(lsm6dso::AccelerometerOutput::Rate208)
+        .unwrap();
+    driver.set_low_power_mode(false).unwrap();
+    driver
+        .set_gyroscope_output(lsm6dso::GyroscopeOutput::Rate208)
+        .unwrap();
+
+    for _ in 0..1000 {
+        println!(" temp {}", driver.read_temperature().unwrap());
+        println!("{:?}", driver.read_all());
+    }
 
     let sysloop = EspSystemEventLoop::take()?;
 
@@ -193,29 +215,29 @@ fn main() -> Result<()> {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:12987")?);
 
     let camera_config = esp_idf_sys::camera::camera_config_t {
-        pin_pwdn: 32,
+        pin_pwdn: -1,
         pin_reset: -1,
-        pin_xclk: 0,
+        pin_xclk: 9,
         sccb_i2c_port: -1,
-        __bindgen_anon_1: esp_idf_sys::camera::camera_config_t__bindgen_ty_1 { pin_sccb_sda: 26 },
-        __bindgen_anon_2: esp_idf_sys::camera::camera_config_t__bindgen_ty_2 { pin_sscb_scl: 27 },
-        pin_d7: 35,
-        pin_d6: 34,
-        pin_d5: 39,
-        pin_d4: 36,
+        __bindgen_anon_1: esp_idf_sys::camera::camera_config_t__bindgen_ty_1 { pin_sccb_sda: 39 },
+        __bindgen_anon_2: esp_idf_sys::camera::camera_config_t__bindgen_ty_2 { pin_sscb_scl: 38 },
+        pin_d7: 40,
+        pin_d6: 10,
+        pin_d5: 11,
+        pin_d4: 13,
         pin_d3: 21,
-        pin_d2: 19,
-        pin_d1: 18,
-        pin_d0: 5,
-        pin_vsync: 25,
-        pin_href: 23,
-        pin_pclk: 22,
+        pin_d2: 48,
+        pin_d1: 47,
+        pin_d0: 14,
+        pin_vsync: 42,
+        pin_href: 41,
+        pin_pclk: 12,
         xclk_freq_hz: 20000000,
         ledc_timer: esp_idf_sys::ledc_timer_t_LEDC_TIMER_0,
         ledc_channel: esp_idf_sys::ledc_channel_t_LEDC_CHANNEL_0,
         pixel_format: esp_idf_sys::camera::pixformat_t_PIXFORMAT_JPEG,
         frame_size: esp_idf_sys::camera::framesize_t_FRAMESIZE_SVGA,
-        jpeg_quality: 14,
+        jpeg_quality: 10,
         fb_count: 2,
         fb_location: esp_idf_sys::camera::camera_fb_location_t_CAMERA_FB_IN_PSRAM,
         grab_mode: esp_idf_sys::camera::camera_grab_mode_t_CAMERA_GRAB_WHEN_EMPTY,
