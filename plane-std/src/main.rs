@@ -2,7 +2,7 @@ use anyhow::{bail, ensure, Result};
 use bytemuck::{self, bytes_of_mut, Zeroable};
 use core::str;
 use esp_idf_hal::{
-    i2c::{I2cConfig, I2cDriver, I2C1},
+    i2c::{I2cConfig, I2cDriver},
     ledc::{LedcDriver, Resolution},
     prelude::*,
 };
@@ -10,80 +10,25 @@ use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     hal::{
         ledc::{config::TimerConfig, LedcTimerDriver},
-        peripheral,
         peripherals::Peripherals,
     },
-    wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi},
 };
 use esp_idf_sys::{nvs_flash_init, ESP_OK};
-use log::info;
 use lsm6dso;
-use protocol;
+use pid::Pid;
+use protocol::{self, Control};
 use std::{
     net::{SocketAddr, UdpSocket},
     str::FromStr,
     sync::Arc,
+    thread::sleep,
     time::{Duration, SystemTime},
 };
 
-pub fn wifi(
-    ssid: &str,
-    pass: &str,
-    modem: impl peripheral::Peripheral<P = esp_idf_svc::hal::modem::Modem> + 'static,
-    sysloop: EspSystemEventLoop,
-) -> Result<Box<EspWifi<'static>>> {
-    let mut auth_method = AuthMethod::WPA2Personal;
+mod wifi;
+use wifi::wifi;
 
-    if ssid.is_empty() {
-        bail!("Missing WiFi name")
-    }
-    if pass.is_empty() {
-        auth_method = AuthMethod::None;
-        info!("Wifi password is empty");
-    }
-    let mut esp_wifi = EspWifi::new(modem, sysloop.clone(), None)?;
-    let mut wifi = BlockingWifi::wrap(&mut esp_wifi, sysloop)?;
-
-    wifi.set_configuration(&Configuration::Client(ClientConfiguration::default()))?;
-    info!("Starting wifi...");
-
-    wifi.start()?;
-    info!("Scanning...");
-    let ap_infos = wifi.scan()?;
-    let ours = ap_infos.into_iter().find(|a| a.ssid == ssid);
-    let channel = if let Some(ours) = ours {
-        info!(
-            "Found configured access point {} on channel {}",
-            ssid, ours.channel
-        );
-        Some(ours.channel)
-    } else {
-        info!(
-            "Configured access point {} not found during scanning, will go with unknown channel",
-            ssid
-        );
-        None
-    };
-    wifi.set_configuration(&Configuration::Client(ClientConfiguration {
-        ssid: ssid.try_into().unwrap(),
-        password: pass.try_into().unwrap(),
-        channel,
-        auth_method,
-        ..Default::default()
-    }))?;
-
-    info!("Connecting wifi...");
-    wifi.connect()?;
-
-    info!("Waiting for DHCP lease...");
-    wifi.wait_netif_up()?;
-
-    let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
-
-    info!("Wifi DHCP info: {:?}", ip_info);
-
-    Ok(Box::new(esp_wifi))
-}
+use itertools::izip;
 
 #[toml_cfg::toml_config]
 pub struct Config {
@@ -93,19 +38,154 @@ pub struct Config {
     wifi_psk: &'static str,
 }
 
-fn command_thread(
-    socket: Arc<UdpSocket>,
-    mut pitch: LedcDriver,
-    mut roll: LedcDriver,
-    mut throttle: LedcDriver,
-) -> Result<()> {
+trait Controller {
+    fn set_rates(&mut self, command: Control);
+}
+
+struct PlaneController<'a> {
+    pitch_driver: LedcDriver<'a>,
+    roll_driver: LedcDriver<'a>,
+    throttle_driver: LedcDriver<'a>,
+    min_duty: u32,
+    max_duty: u32,
+}
+
+impl Controller for PlaneController<'_> {
+    fn set_rates(&mut self, command: Control) {
+        let min_duty = self.min_duty;
+        let max_duty = self.max_duty;
+        let pitch_value =
+            (((command.pitch + 1.0) / 2.0) * (max_duty - min_duty) as f32) as u32 + min_duty;
+        let roll_value =
+            (((command.roll + 1.0) / 2.0) * (max_duty - min_duty) as f32) as u32 + min_duty;
+        let throttle_value = (command.throttle * (max_duty - min_duty) as f32) as u32 + min_duty;
+
+        self.pitch_driver.set_duty(pitch_value).unwrap_or_default();
+        self.roll_driver.set_duty(roll_value).unwrap_or_default();
+        self.throttle_driver
+            .set_duty(throttle_value)
+            .unwrap_or_default();
+    }
+}
+
+struct QuadController<'a> {
+    left_front: LedcDriver<'a>,
+    left_back: LedcDriver<'a>,
+    right_front: LedcDriver<'a>,
+    right_back: LedcDriver<'a>,
+    imu: lsm6dso::Lsm6dso<I2cDriver<'a>>,
+    rates_zero: [f32; 3],
+    pids: [pid::Pid<f32>; 3],
+}
+
+impl Controller for QuadController<'_> {
+    fn set_rates(&mut self, command: Control) {
+        let rates: [f32; 3] = self.imu.read_gyro().unwrap().into();
+        let command_rates: [f32; 3] = [command.pitch, command.roll, command.yaw];
+        let control_outputs: [f32; 3] =
+            izip!(self.pids.iter_mut(), rates, self.rates_zero, command_rates)
+                .map(|(p, rate, rate_zero, command_rate)| {
+                    p.setpoint(command_rate);
+                    let control = p.next_control_output(rate - rate_zero);
+                    control.output
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap();
+
+        let [pitch, roll, yaw] = control_outputs;
+
+        let left_front = pitch + roll + yaw;
+        let left_back = -pitch + roll - yaw;
+        let right_front = pitch - roll - yaw;
+        let right_back = -pitch - roll + yaw;
+
+        let control_max = [left_front, right_front, left_back, right_back]
+            .iter()
+            .map(|x| x.abs())
+            .fold(f32::NEG_INFINITY, |a, b| a.max(b));
+
+        let normalize =
+            (control_max + 0.0001).min(command.throttle + 0.0001) / (control_max + 0.0001);
+        println!("normalize {}", normalize);
+
+        let scale = 0.5;
+
+        let left_front = (command.throttle + left_front * normalize) * scale;
+        let left_back = (command.throttle + left_back * normalize) * scale;
+        let right_back = (command.throttle + right_back * normalize) * scale;
+        let right_front = (command.throttle + right_front * normalize) * scale;
+
+        self.left_front
+            .set_duty((left_front * 255.0).max(0.0).round() as u32)
+            .unwrap();
+        self.left_back
+            .set_duty((left_back * 255.0).max(0.0).round() as u32)
+            .unwrap();
+        self.right_front
+            .set_duty((right_front * 255.0).max(0.0).round() as u32)
+            .unwrap();
+        self.right_back
+            .set_duty((right_back * 255.0).max(0.0).round() as u32)
+            .unwrap();
+
+        println!(
+            "{:03} {:03}\n{:03} {:03}",
+            left_front, right_front, left_back, right_back
+        );
+    }
+}
+
+fn build_quad_controller<'a>(
+    left_front: LedcDriver<'a>,
+    left_back: LedcDriver<'a>,
+    right_front: LedcDriver<'a>,
+    right_back: LedcDriver<'a>,
+    imu: lsm6dso::Lsm6dso<I2cDriver<'a>>,
+) -> QuadController<'a> {
+    sleep(Duration::from_secs_f32(1.0));
+    let mut imu = imu;
+    let rates_zero: [f32; 3] = imu.read_gyro().unwrap().into();
+    eprint!("zero rates {:?}", rates_zero);
+    let controller = QuadController {
+        left_front,
+        left_back,
+        right_front,
+        right_back,
+        imu,
+        rates_zero,
+        pids: [
+            *Pid::new(0.0, 1.0).p(0.5, 1.0).d(1.5, 1.0),
+            *Pid::new(0.0, 1.0).p(0.5, 1.0).d(1.5, 1.0),
+            *Pid::new(0.0, 1.0).p(0.5, 1.0).d(0.5, 1.0),
+        ],
+    };
+    controller
+}
+fn build_plane_controller<'a>(
+    pitch: LedcDriver<'a>,
+    roll: LedcDriver<'a>,
+    throttle: LedcDriver<'a>,
+) -> PlaneController<'a> {
+    let min_duty = pitch.get_max_duty() * 1 / 20;
+    let max_duty = pitch.get_max_duty() * 2 / 20;
+
+    let controller = PlaneController {
+        pitch_driver: pitch,
+        roll_driver: roll,
+        throttle_driver: throttle,
+        min_duty,
+        max_duty,
+    };
+    controller
+}
+
+fn command_thread(socket: Arc<UdpSocket>, controller: impl Controller) -> Result<()> {
+    let mut controller = controller;
     println!("command thread started!");
     socket
         .set_read_timeout(Some(Duration::from_millis(200)))
         .unwrap();
-    let min_duty = pitch.get_max_duty() * 1 / 20;
-    let max_duty = pitch.get_max_duty() * 2 / 20;
-    println!("{} {}", min_duty, max_duty);
 
     loop {
         let mut command = protocol::Control::zeroed();
@@ -115,24 +195,16 @@ fn command_thread(
             Ok((amt, _)) => amt == buf.len(),
             _ => {
                 command = protocol::Control {
-                    pitch: 0.5,
-                    roll: 0.5,
+                    pitch: 0.0,
+                    roll: 0.0,
+                    yaw: 0.0,
                     throttle: 0.0,
                 };
                 true
             }
         };
         if ok {
-            let pitch_value =
-                (((command.pitch + 1.0) / 2.0) * (max_duty - min_duty) as f32) as u32 + min_duty;
-            let roll_value =
-                (((command.roll + 1.0) / 2.0) * (max_duty - min_duty) as f32) as u32 + min_duty;
-            let throttle_value =
-                (command.throttle * (max_duty - min_duty) as f32) as u32 + min_duty;
-
-            pitch.set_duty(pitch_value).unwrap_or_default();
-            roll.set_duty(roll_value).unwrap_or_default();
-            throttle.set_duty(throttle_value).unwrap_or_default();
+            controller.set_rates(command);
         }
     }
 }
@@ -150,34 +222,60 @@ fn main() -> Result<()> {
     let timer_driver = LedcTimerDriver::new(
         peripherals.ledc.timer1,
         &TimerConfig::default()
-            .frequency(50.Hz())
-            .resolution(Resolution::Bits14),
+            .frequency(100000.Hz())
+            .resolution(Resolution::Bits8),
     )
     .unwrap();
 
-    let driver_pitch = LedcDriver::new(
+    // let driver_pitch = LedcDriver::new(
+    //     peripherals.ledc.channel4,
+    //     &timer_driver,
+    //     peripherals.pins.gpio2,
+    // )
+    // .unwrap();
+    // let driver_roll = LedcDriver::new(
+    //     peripherals.ledc.channel5,
+    //     &timer_driver,
+    //     peripherals.pins.gpio16,
+    // )
+    // .unwrap();
+    // let driver_throttle = LedcDriver::new(
+    //     peripherals.ledc.channel6,
+    //     &timer_driver,
+    //     peripherals.pins.gpio1,
+    // )
+    // .unwrap();
+    let driver_left_front = LedcDriver::new(
         peripherals.ledc.channel4,
         &timer_driver,
-        peripherals.pins.gpio2,
+        peripherals.pins.gpio18,
     )
     .unwrap();
-    let driver_roll = LedcDriver::new(
+    let driver_left_back = LedcDriver::new(
         peripherals.ledc.channel5,
         &timer_driver,
-        peripherals.pins.gpio16,
+        peripherals.pins.gpio17,
+    )
+    .unwrap();
+    let driver_right_back = LedcDriver::new(
+        peripherals.ledc.channel6,
+        &timer_driver,
+        peripherals.pins.gpio6,
+    )
+    .unwrap();
+    let driver_right_front = LedcDriver::new(
+        peripherals.ledc.channel7,
+        &timer_driver,
+        peripherals.pins.gpio5,
     )
     .unwrap();
 
-    let driver_throttle = LedcDriver::new(
-        peripherals.ledc.channel6,
-        &timer_driver,
-        peripherals.pins.gpio1,
-    )
-    .unwrap();
+    // let plane_controller = build_plane_controller(driver_pitch, driver_roll, driver_throttle);
+
     let sda = peripherals.pins.gpio15;
     let scl = peripherals.pins.gpio7;
 
-    let config = I2cConfig::new().baudrate(100.kHz().into());
+    let config = I2cConfig::new().baudrate(1000.kHz().into());
     let i2cdriver = I2cDriver::new(peripherals.i2c0, sda, scl, &config).unwrap();
 
     let mut driver = lsm6dso::Lsm6dso::new(i2cdriver, 0x6a).unwrap();
@@ -189,11 +287,6 @@ fn main() -> Result<()> {
     driver
         .set_gyroscope_output(lsm6dso::GyroscopeOutput::Rate208)
         .unwrap();
-
-    for _ in 0..1000 {
-        println!(" temp {}", driver.read_temperature().unwrap());
-        println!("{:?}", driver.read_all());
-    }
 
     let sysloop = EspSystemEventLoop::take()?;
 
@@ -245,9 +338,14 @@ fn main() -> Result<()> {
 
     {
         let socket = socket.clone();
-        std::thread::spawn(move || {
-            command_thread(socket, driver_pitch, driver_roll, driver_throttle)
-        });
+        let controller = build_quad_controller(
+            driver_left_front,
+            driver_left_back,
+            driver_right_front,
+            driver_right_back,
+            driver,
+        );
+        std::thread::spawn(move || command_thread(socket, controller));
     }
 
     let server = SocketAddr::from_str("192.168.1.197:12892")?;

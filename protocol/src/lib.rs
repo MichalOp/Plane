@@ -7,6 +7,7 @@ const PACKET_LEN: u32 = 496;
 pub struct Control {
     pub roll: f32,
     pub pitch: f32,
+    pub yaw: f32,
     pub throttle: f32,
 }
 

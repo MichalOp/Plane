@@ -68,11 +68,16 @@ async fn track_events(controller: Controller, control: Arc<Mutex<Control>>) {
             }
             Event::JoyY(y) => {
                 // info!("pitch {}", y);
-                control.lock().unwrap().pitch = -y as f32;
+                control.lock().unwrap().pitch = y as f32;
+            }
+            Event::CamZ(z) => {
+                // info!("yaw {}", y);
+                let normalized_val = ((z + 0.9843740462674724) / (1.0 - 0.9843740462674724)) as f32;
+                control.lock().unwrap().yaw = normalized_val;
             }
             Event::Throttle(t) => {
                 // info!("throttle {}", t);
-                control.lock().unwrap().throttle = t as f32;
+                control.lock().unwrap().throttle = (1.0 - t) as f32;
             }
             _ => {}
         }
