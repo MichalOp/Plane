@@ -11,6 +11,12 @@ pub struct Control {
     pub throttle: f32,
 }
 
+#[derive(Clone, Copy, Zeroable, Pod, Debug)]
+#[repr(C)]
+pub struct Telemetry {
+    pub voltage: u16,
+}
+
 /// The packet messaging protocol.
 /// It is assumed that life is hard but not too hard. More precisely:
 /// - Packets might be randomly missing, but that is rare.

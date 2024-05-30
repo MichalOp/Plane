@@ -1,7 +1,10 @@
+#![feature(generic_arg_infer)]
+
 use anyhow::{bail, ensure, Result};
-use bytemuck::{self, bytes_of_mut, Zeroable};
+use bytemuck::{self, bytes_of, bytes_of_mut, Zeroable};
 use core::str;
 use esp_idf_hal::{
+    adc::{self, AdcChannelDriver, AdcDriver, Atten11dB, ADC1},
     i2c::{I2cConfig, I2cDriver},
     ledc::{LedcDriver, Resolution},
     prelude::*,
@@ -16,7 +19,7 @@ use esp_idf_svc::{
 use esp_idf_sys::{nvs_flash_init, ESP_OK};
 use lsm6dso;
 use pid::Pid;
-use protocol::{self, Control};
+use protocol::{self, Control, Telemetry};
 use std::{
     net::{SocketAddr, UdpSocket},
     str::FromStr,
@@ -107,7 +110,7 @@ impl Controller for QuadController<'_> {
 
         let normalize =
             (control_max + 0.0001).min(command.throttle + 0.0001) / (control_max + 0.0001);
-        println!("normalize {}", normalize);
+        // println!("normalize {}", normalize);
 
         let scale = 0.5;
 
@@ -129,10 +132,10 @@ impl Controller for QuadController<'_> {
             .set_duty((right_back * 255.0).max(0.0).round() as u32)
             .unwrap();
 
-        println!(
-            "{:03} {:03}\n{:03} {:03}",
-            left_front, right_front, left_back, right_back
-        );
+        // println!(
+        //     "{:03} {:03}\n{:03} {:03}",
+        //     left_front, right_front, left_back, right_back
+        // );
     }
 }
 
@@ -155,8 +158,8 @@ fn build_quad_controller<'a>(
         imu,
         rates_zero,
         pids: [
-            *Pid::new(0.0, 1.0).p(0.5, 1.0).d(1.5, 1.0),
-            *Pid::new(0.0, 1.0).p(0.5, 1.0).d(1.5, 1.0),
+            *Pid::new(0.0, 1.0).p(0.3, 1.0).d(1.5, 1.0),
+            *Pid::new(0.0, 1.0).p(0.3, 1.0).d(1.5, 1.0),
             *Pid::new(0.0, 1.0).p(0.5, 1.0).d(0.5, 1.0),
         ],
     };
@@ -226,6 +229,13 @@ fn main() -> Result<()> {
             .resolution(Resolution::Bits8),
     )
     .unwrap();
+
+    let mut adc = AdcDriver::new(
+        peripherals.adc1,
+        &adc::config::Config::new().calibration(false),
+    )?;
+    let mut adc_pin: esp_idf_hal::adc::AdcChannelDriver<{ adc::attenuation::DB_11 }, _> =
+        AdcChannelDriver::new(peripherals.pins.gpio8)?;
 
     // let driver_pitch = LedcDriver::new(
     //     peripherals.ledc.channel4,
@@ -329,7 +339,7 @@ fn main() -> Result<()> {
         ledc_timer: esp_idf_sys::ledc_timer_t_LEDC_TIMER_0,
         ledc_channel: esp_idf_sys::ledc_channel_t_LEDC_CHANNEL_0,
         pixel_format: esp_idf_sys::camera::pixformat_t_PIXFORMAT_JPEG,
-        frame_size: esp_idf_sys::camera::framesize_t_FRAMESIZE_SVGA,
+        frame_size: esp_idf_sys::camera::framesize_t_FRAMESIZE_CIF,
         jpeg_quality: 10,
         fb_count: 2,
         fb_location: esp_idf_sys::camera::camera_fb_location_t_CAMERA_FB_IN_PSRAM,
@@ -369,7 +379,20 @@ fn main() -> Result<()> {
 
         let t2 = SystemTime::now();
 
-        while let Err(x) = socket.send_to(data, server) {
+        let mut v = 0;
+        for _ in 0..10 {
+            v += adc.read(&mut adc_pin).unwrap_or_default();
+        }
+
+        let tele = Telemetry { voltage: v };
+
+        let data_vec: Vec<u8> = bytes_of(&tele)
+            .iter()
+            .chain(data.iter().to_owned())
+            .map(|x| *x)
+            .collect();
+
+        while let Err(x) = socket.send_to(&data_vec, server) {
             println!("Failed to send: {}", x);
             continue;
         }

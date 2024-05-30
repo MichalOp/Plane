@@ -1,4 +1,5 @@
 use std::{
+    mem::size_of,
     net::SocketAddr,
     sync::{Arc, Mutex},
     thread,
@@ -6,20 +7,25 @@ use std::{
 };
 
 use anyhow;
-use bytemuck::{bytes_of, Zeroable};
+use bytemuck::{bytes_of, bytes_of_mut, Zeroable};
 use eframe::egui;
 use egui::{Color32, TextureHandle};
-use image::imageops::resize;
-use protocol::Control;
+use protocol::{Control, Telemetry};
 use stick::{Controller, Event, Listener};
 use tokio::net::UdpSocket;
 use tokio::time;
 use tracing::{info, warn};
 use turbojpeg;
 
+struct DisplayData {
+    image_data: egui::ImageData,
+    telemetry: Telemetry,
+    voltage_avg: f32,
+}
+
 async fn video_server(
     socket: Arc<UdpSocket>,
-    buffer: Arc<Mutex<egui::ImageData>>,
+    buffer: Arc<Mutex<DisplayData>>,
     plane_ip: Arc<Mutex<Option<SocketAddr>>>,
 ) -> anyhow::Result<()> {
     // Receives a single datagram message on the socket. If `buf` is too small to hold
@@ -30,7 +36,14 @@ async fn video_server(
         *plane_ip.lock().unwrap() = Some(src);
         if amt > 0 {
             // info!("Parsing! {}", payload.len());
-            let img: Result<image::RgbImage, _> = turbojpeg::decompress_image(&buf);
+
+            let mut telemetry = Telemetry::zeroed();
+
+            let tele_buf = bytes_of_mut(&mut telemetry);
+            tele_buf.clone_from_slice(&buf[..size_of::<Telemetry>()]);
+
+            let img: Result<image::RgbImage, _> =
+                turbojpeg::decompress_image(&buf[size_of::<Telemetry>()..]);
             if img.is_err() {
                 warn!("eh {}", img.err().unwrap());
                 continue;
@@ -43,16 +56,20 @@ async fn video_server(
             //     image::imageops::FilterType::Nearest,
             // );
             let mut locked = buffer.lock().unwrap();
-            *locked = egui::ImageData::Color(
-                egui::ColorImage {
-                    size: [img.width() as usize, img.height() as usize],
-                    pixels: img
-                        .pixels()
-                        .map(|x| Color32::from_rgb(x.0[0], x.0[1], x.0[2]))
-                        .collect(),
-                }
-                .into(),
-            );
+            *locked = DisplayData {
+                image_data: egui::ImageData::Color(
+                    egui::ColorImage {
+                        size: [img.width() as usize, img.height() as usize],
+                        pixels: img
+                            .pixels()
+                            .map(|x| Color32::from_rgb(x.0[0], x.0[1], x.0[2]))
+                            .collect(),
+                    }
+                    .into(),
+                ),
+                telemetry,
+                voltage_avg: locked.voltage_avg,
+            }
         }
     }
 }
@@ -64,16 +81,16 @@ async fn track_events(controller: Controller, control: Arc<Mutex<Control>>) {
         match event {
             Event::JoyX(x) => {
                 // info!("roll {}", x);
-                control.lock().unwrap().roll = x as f32;
+                control.lock().unwrap().roll = x as f32 * 5.0;
             }
             Event::JoyY(y) => {
                 // info!("pitch {}", y);
-                control.lock().unwrap().pitch = y as f32;
+                control.lock().unwrap().pitch = y as f32 * 5.0;
             }
             Event::CamZ(z) => {
                 // info!("yaw {}", y);
                 let normalized_val = ((z + 0.9843740462674724) / (1.0 - 0.9843740462674724)) as f32;
-                control.lock().unwrap().yaw = normalized_val;
+                control.lock().unwrap().yaw = normalized_val * -2.0;
             }
             Event::Throttle(t) => {
                 // info!("throttle {}", t);
@@ -103,7 +120,7 @@ async fn send_command(
     }
 }
 
-async fn tokio_main(buffer: Arc<Mutex<egui::ImageData>>) -> anyhow::Result<()> {
+async fn tokio_main(buffer: Arc<Mutex<DisplayData>>) -> anyhow::Result<()> {
     let control = Arc::new(Mutex::new(Control::zeroed()));
     let plane_ip: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:12892").await.unwrap());
@@ -143,7 +160,11 @@ fn main() {
     env_logger::init();
     tracing::subscriber::set_global_default(tracing_subscriber::FmtSubscriber::new())
         .expect("setting tracing default failed");
-    let buffer = Arc::new(Mutex::new(make_debug_image()));
+    let buffer = Arc::new(Mutex::new(DisplayData {
+        image_data: make_debug_image(),
+        telemetry: Telemetry::zeroed(),
+        voltage_avg: 0.0,
+    }));
     let buffer_cloned = buffer.clone();
 
     let tokio_thread = thread::spawn(move || {
@@ -165,13 +186,13 @@ fn main() {
 }
 
 struct MyEguiApp {
-    image_buffer: Arc<Mutex<egui::ImageData>>,
+    image_buffer: Arc<Mutex<DisplayData>>,
     texture: TextureHandle,
     i: u32,
 }
 
 impl MyEguiApp {
-    fn new(cc: &eframe::CreationContext<'_>, image_buffer: Arc<Mutex<egui::ImageData>>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, image_buffer: Arc<Mutex<DisplayData>>) -> Self {
         // Customize egui here with cc.egui_ctx.set_fonts and cc.egui_ctx.set_visuals.
         // Restore app state using cc.storage (requires the "persistence" feature).
         // Use the cc.gl (a glow::Context) to create graphics shaders and buffers that you can use
@@ -191,8 +212,13 @@ impl MyEguiApp {
 impl eframe::App for MyEguiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            let thing = self.image_buffer.lock().unwrap();
-            self.texture.set(thing.clone(), Default::default());
+            let mut thing = self.image_buffer.lock().unwrap();
+            self.texture
+                .set(thing.image_data.clone(), Default::default());
+            let v = thing.telemetry.voltage / 10;
+            let voltage = v as f32 / 570.0 * 0.66 * ((150.0 + 680.0) / (150.0));
+            thing.voltage_avg = thing.voltage_avg * 0.95 + voltage * 0.05;
+            ui.heading(format!("{:.02}V", thing.voltage_avg));
             ui.centered_and_justified(|ui| {
                 ui.add(
                     egui::Image::new(&self.texture)
@@ -200,7 +226,6 @@ impl eframe::App for MyEguiApp {
                         .fit_to_exact_size(ui.available_size()),
                 )
             });
-            ui.heading(format!("Hello World! {}", self.i));
             self.i += 1;
             ctx.request_repaint();
         });
