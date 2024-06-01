@@ -1,6 +1,8 @@
 use std::{
+    f32::consts::PI,
     mem::size_of,
     net::SocketAddr,
+    path::Path,
     sync::{Arc, Mutex},
     thread,
     time::Duration,
@@ -10,6 +12,7 @@ use anyhow;
 use bytemuck::{bytes_of, bytes_of_mut, Zeroable};
 use eframe::egui;
 use egui::{Color32, TextureHandle};
+use ndarray::Array3;
 use protocol::{Control, Telemetry};
 use stick::{Controller, Event, Listener};
 use tokio::net::UdpSocket;
@@ -17,10 +20,16 @@ use tokio::time;
 use tracing::{info, warn};
 use turbojpeg;
 
+use chrono::{DateTime, Local};
+
+use video_rs::encode::{Encoder, Settings};
+use video_rs::time::Time;
+
 struct DisplayData {
     image_data: egui::ImageData,
     telemetry: Telemetry,
     voltage_avg: f32,
+    recording: bool,
 }
 
 async fn video_server(
@@ -30,6 +39,11 @@ async fn video_server(
 ) -> anyhow::Result<()> {
     // Receives a single datagram message on the socket. If `buf` is too small to hold
     // the message, it will be cut off.
+
+    let mut encoder: Option<Encoder> = None;
+    let mut position = Time::zero();
+    let duration: Time = Time::from_nth_of_a_second(33);
+
     loop {
         let mut buf = [0; 65536];
         let (amt, src) = socket.recv_from(&mut buf).await.unwrap();
@@ -49,13 +63,8 @@ async fn video_server(
                 continue;
             }
             let img = img.unwrap();
-            // let img = resize(
-            //     &img,
-            //     img.width() * 2,
-            //     img.height() * 2,
-            //     image::imageops::FilterType::Nearest,
-            // );
             let mut locked = buffer.lock().unwrap();
+
             *locked = DisplayData {
                 image_data: egui::ImageData::Color(
                     egui::ColorImage {
@@ -68,29 +77,89 @@ async fn video_server(
                     .into(),
                 ),
                 telemetry,
+                recording: locked.recording,
                 voltage_avg: locked.voltage_avg,
+            };
+            let recording = locked.recording;
+            drop(locked);
+
+            if encoder.is_none() && recording {
+                let settings = Settings::preset_h264_yuv420p(
+                    img.width() as usize,
+                    img.height() as usize,
+                    false,
+                );
+
+                let current_local: DateTime<Local> = Local::now();
+                let custom_format = current_local.format("%Y-%m-%d-%H-%M-%S");
+                let filename = format!("/home/michal/flightrecordings/{}.mp4", custom_format);
+                encoder = Some(
+                    Encoder::new(Path::new(&filename), settings).expect("failed to create encoder"),
+                );
+                position = Time::zero();
+            }
+            if encoder.is_some() {
+                let (width, height) = img.dimensions();
+                // Create a vector to hold the data
+                let mut data = Vec::with_capacity((width * height * 3) as usize);
+
+                // Copy the pixel data into the vector
+                for pixel in img.pixels() {
+                    data.extend_from_slice(&pixel.0);
+                }
+
+                let array = Array3::from_shape_vec((height as usize, width as usize, 3), data)
+                    .expect("failed to convert");
+                encoder
+                    .as_mut()
+                    .unwrap()
+                    .encode(&array, position)
+                    .expect("failed to encode frame");
+
+                position = position.aligned_with(duration).add();
+
+                if !recording {
+                    encoder
+                        .as_mut()
+                        .unwrap()
+                        .finish()
+                        .expect("failed to finish recording");
+                    encoder = None;
+                }
             }
         }
     }
 }
 
-async fn track_events(controller: Controller, control: Arc<Mutex<Control>>) {
+fn control_modifier(x: f32) -> f32 {
+    (x.powi(2) * x.signum() * 0.9 + x * 0.1) * PI * 3.0
+}
+
+async fn track_events(
+    controller: Controller,
+    control: Arc<Mutex<Control>>,
+    display_data: Arc<Mutex<DisplayData>>,
+) {
     let mut controller = controller;
     loop {
         let event = (&mut controller).await;
         match event {
+            Event::Trigger(x) => {
+                if x {
+                    let mut d = display_data.lock().unwrap();
+                    d.recording = !d.recording;
+                }
+            }
             Event::JoyX(x) => {
-                // info!("roll {}", x);
-                control.lock().unwrap().roll = x as f32 * 5.0;
+                control.lock().unwrap().roll = control_modifier(x as f32);
             }
             Event::JoyY(y) => {
-                // info!("pitch {}", y);
-                control.lock().unwrap().pitch = y as f32 * 5.0;
+                control.lock().unwrap().pitch = control_modifier(y as f32);
             }
             Event::CamZ(z) => {
                 // info!("yaw {}", y);
                 let normalized_val = ((z + 0.9843740462674724) / (1.0 - 0.9843740462674724)) as f32;
-                control.lock().unwrap().yaw = normalized_val * -2.0;
+                control.lock().unwrap().yaw = -control_modifier(normalized_val);
             }
             Event::Throttle(t) => {
                 // info!("throttle {}", t);
@@ -131,14 +200,16 @@ async fn tokio_main(buffer: Arc<Mutex<DisplayData>>) -> anyhow::Result<()> {
         let socket = socket.clone();
         tokio::task::spawn(async move { send_command(socket, control, plane_ip).await });
     }
-    tokio::task::spawn(async move { video_server(socket, buffer, plane_ip).await });
+    let buffer_cloned = buffer.clone();
+    tokio::task::spawn(async move { video_server(socket, buffer_cloned, plane_ip).await });
     let mut listener = Listener::default();
     loop {
         let controller = (&mut listener).await;
         println!("{:?}", controller);
         if controller.name() == "Thrustmaster T.16000M" {
             let control = control.clone();
-            tokio::task::spawn(async move { track_events(controller, control).await });
+            let buffer = buffer.clone();
+            tokio::task::spawn(async move { track_events(controller, control, buffer).await });
         }
     }
 }
@@ -164,6 +235,7 @@ fn main() {
         image_data: make_debug_image(),
         telemetry: Telemetry::zeroed(),
         voltage_avg: 0.0,
+        recording: false,
     }));
     let buffer_cloned = buffer.clone();
 
@@ -186,13 +258,13 @@ fn main() {
 }
 
 struct MyEguiApp {
-    image_buffer: Arc<Mutex<DisplayData>>,
+    display_info: Arc<Mutex<DisplayData>>,
     texture: TextureHandle,
     i: u32,
 }
 
 impl MyEguiApp {
-    fn new(cc: &eframe::CreationContext<'_>, image_buffer: Arc<Mutex<DisplayData>>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, display_info: Arc<Mutex<DisplayData>>) -> Self {
         // Customize egui here with cc.egui_ctx.set_fonts and cc.egui_ctx.set_visuals.
         // Restore app state using cc.storage (requires the "persistence" feature).
         // Use the cc.gl (a glow::Context) to create graphics shaders and buffers that you can use
@@ -202,7 +274,7 @@ impl MyEguiApp {
             .load_texture("display", make_debug_image(), Default::default());
 
         Self {
-            image_buffer,
+            display_info,
             texture,
             i: 0,
         }
@@ -212,13 +284,22 @@ impl MyEguiApp {
 impl eframe::App for MyEguiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            let mut thing = self.image_buffer.lock().unwrap();
+            let mut locked_display_info = self.display_info.lock().unwrap();
             self.texture
-                .set(thing.image_data.clone(), Default::default());
-            let v = thing.telemetry.voltage / 10;
+                .set(locked_display_info.image_data.clone(), Default::default());
+            let v = locked_display_info.telemetry.voltage / 10;
             let voltage = v as f32 / 570.0 * 0.66 * ((150.0 + 680.0) / (150.0));
-            thing.voltage_avg = thing.voltage_avg * 0.95 + voltage * 0.05;
-            ui.heading(format!("{:.02}V", thing.voltage_avg));
+            locked_display_info.voltage_avg =
+                locked_display_info.voltage_avg * 0.95 + voltage * 0.05;
+            ui.heading(format!(
+                "{:.02}V            {}",
+                locked_display_info.voltage_avg,
+                if locked_display_info.recording {
+                    "RECORDING"
+                } else {
+                    ""
+                }
+            ));
             ui.centered_and_justified(|ui| {
                 ui.add(
                     egui::Image::new(&self.texture)

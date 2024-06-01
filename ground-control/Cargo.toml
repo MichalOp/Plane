@@ -19,3 +19,7 @@ anyhow = "1.0.82"
 turbojpeg = { version = "1.1.0", features = ["image"] }
 stick = "0.13.0"
 tokio = { version = "1.37.0", features = ["full"] }
+ndarray = "0.15.6"
+nshare = "0.9.0"
+chrono = "0.4"
+video-rs = { version = "0.8.1", features = ["ndarray"] }

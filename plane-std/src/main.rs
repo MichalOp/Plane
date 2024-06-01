@@ -16,7 +16,7 @@ use esp_idf_svc::{
         peripherals::Peripherals,
     },
 };
-use esp_idf_sys::{nvs_flash_init, ESP_OK};
+use esp_idf_sys::{esp_wifi_get_max_tx_power, ets_get_cpu_frequency, nvs_flash_init, ESP_OK};
 use lsm6dso;
 use pid::Pid;
 use protocol::{self, Control, Telemetry};
@@ -25,7 +25,7 @@ use std::{
     str::FromStr,
     sync::Arc,
     thread::sleep,
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, SystemTimeError},
 };
 
 mod wifi;
@@ -112,7 +112,7 @@ impl Controller for QuadController<'_> {
             (control_max + 0.0001).min(command.throttle + 0.0001) / (control_max + 0.0001);
         // println!("normalize {}", normalize);
 
-        let scale = 0.5;
+        let scale = 0.66;
 
         let left_front = (command.throttle + left_front * normalize) * scale;
         let left_back = (command.throttle + left_back * normalize) * scale;
@@ -120,16 +120,16 @@ impl Controller for QuadController<'_> {
         let right_front = (command.throttle + right_front * normalize) * scale;
 
         self.left_front
-            .set_duty((left_front * 255.0).max(0.0).round() as u32)
+            .set_duty((left_front.clamp(0.0, 1.0) * 255.0).round() as u32)
             .unwrap();
         self.left_back
-            .set_duty((left_back * 255.0).max(0.0).round() as u32)
+            .set_duty((left_back.clamp(0.0, 1.0) * 255.0).round() as u32)
             .unwrap();
         self.right_front
-            .set_duty((right_front * 255.0).max(0.0).round() as u32)
+            .set_duty((right_front.clamp(0.0, 1.0) * 255.0).round() as u32)
             .unwrap();
         self.right_back
-            .set_duty((right_back * 255.0).max(0.0).round() as u32)
+            .set_duty((right_back.clamp(0.0, 1.0) * 255.0).round() as u32)
             .unwrap();
 
         // println!(
@@ -187,28 +187,56 @@ fn command_thread(socket: Arc<UdpSocket>, controller: impl Controller) -> Result
     let mut controller = controller;
     println!("command thread started!");
     socket
-        .set_read_timeout(Some(Duration::from_millis(200)))
+        .set_read_timeout(Some(Duration::from_micros(1000)))
         .unwrap();
 
+    let mut command = protocol::Control::zeroed();
+    let mut last_command_time = SystemTime::now();
     loop {
-        let mut command = protocol::Control::zeroed();
-        let buf = bytes_of_mut(&mut command);
+        let loop_start_time = SystemTime::now();
+        let mut new_command = protocol::Control::zeroed();
+        let buf = bytes_of_mut(&mut new_command);
         let recv_value = socket.recv_from(buf);
         let ok = match recv_value {
             Ok((amt, _)) => amt == buf.len(),
-            _ => {
-                command = protocol::Control {
-                    pitch: 0.0,
-                    roll: 0.0,
-                    yaw: 0.0,
-                    throttle: 0.0,
-                };
-                true
-            }
+            _ => false,
         };
+        let current_time = SystemTime::now();
         if ok {
-            controller.set_rates(command);
+            command = new_command;
+            last_command_time = current_time;
+        };
+
+        if current_time
+            .duration_since(last_command_time)
+            .unwrap()
+            .as_secs_f32()
+            > 0.2
+        {
+            command = protocol::Control {
+                pitch: 0.0,
+                roll: 0.0,
+                yaw: 0.0,
+                throttle: 0.0,
+            };
         }
+
+        controller.set_rates(command);
+
+        let current_time = SystemTime::now();
+
+        let duration =
+            match (loop_start_time + Duration::from_millis(5)).duration_since(current_time) {
+                Ok(duration) => duration,
+                Err(time_err) => {
+                    println!(
+                        "Missed deadline by {} microseconds!",
+                        time_err.duration().as_micros(),
+                    );
+                    Duration::from_micros(0)
+                }
+            };
+        sleep(duration);
     }
 }
 
@@ -293,9 +321,11 @@ fn main() -> Result<()> {
     driver
         .set_accelerometer_output(lsm6dso::AccelerometerOutput::Rate208)
         .unwrap();
-    driver.set_low_power_mode(false).unwrap();
     driver
         .set_gyroscope_output(lsm6dso::GyroscopeOutput::Rate208)
+        .unwrap();
+    driver
+        .set_gyroscope_scale(lsm6dso::GyroscopeFullScale::Dps1000)
         .unwrap();
 
     let sysloop = EspSystemEventLoop::take()?;
@@ -335,12 +365,12 @@ fn main() -> Result<()> {
         pin_vsync: 42,
         pin_href: 41,
         pin_pclk: 12,
-        xclk_freq_hz: 20000000,
+        xclk_freq_hz: 24000000,
         ledc_timer: esp_idf_sys::ledc_timer_t_LEDC_TIMER_0,
         ledc_channel: esp_idf_sys::ledc_channel_t_LEDC_CHANNEL_0,
         pixel_format: esp_idf_sys::camera::pixformat_t_PIXFORMAT_JPEG,
-        frame_size: esp_idf_sys::camera::framesize_t_FRAMESIZE_CIF,
-        jpeg_quality: 10,
+        frame_size: esp_idf_sys::camera::framesize_t_FRAMESIZE_SVGA,
+        jpeg_quality: 14,
         fb_count: 2,
         fb_location: esp_idf_sys::camera::camera_fb_location_t_CAMERA_FB_IN_PSRAM,
         grab_mode: esp_idf_sys::camera::camera_grab_mode_t_CAMERA_GRAB_WHEN_EMPTY,
@@ -383,6 +413,8 @@ fn main() -> Result<()> {
         for _ in 0..10 {
             v += adc.read(&mut adc_pin).unwrap_or_default();
         }
+        // let tadc = SystemTime::now();
+        // println!("ADC time: {}", tadc.duration_since(t2).unwrap().as_micros());
 
         let tele = Telemetry { voltage: v };
 
