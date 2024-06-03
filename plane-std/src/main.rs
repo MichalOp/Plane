@@ -146,7 +146,6 @@ fn build_quad_controller<'a>(
     right_back: LedcDriver<'a>,
     imu: lsm6dso::Lsm6dso<I2cDriver<'a>>,
 ) -> QuadController<'a> {
-    sleep(Duration::from_secs_f32(1.0));
     let mut imu = imu;
     let rates_zero: [f32; 3] = imu.read_gyro().unwrap().into();
     eprint!("zero rates {:?}", rates_zero);
@@ -369,8 +368,8 @@ fn main() -> Result<()> {
         ledc_timer: esp_idf_sys::ledc_timer_t_LEDC_TIMER_0,
         ledc_channel: esp_idf_sys::ledc_channel_t_LEDC_CHANNEL_0,
         pixel_format: esp_idf_sys::camera::pixformat_t_PIXFORMAT_JPEG,
-        frame_size: esp_idf_sys::camera::framesize_t_FRAMESIZE_SVGA,
-        jpeg_quality: 14,
+        frame_size: esp_idf_sys::camera::framesize_t_FRAMESIZE_CIF,
+        jpeg_quality: 10,
         fb_count: 2,
         fb_location: esp_idf_sys::camera::camera_fb_location_t_CAMERA_FB_IN_PSRAM,
         grab_mode: esp_idf_sys::camera::camera_grab_mode_t_CAMERA_GRAB_WHEN_EMPTY,

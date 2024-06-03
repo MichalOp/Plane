@@ -42,7 +42,7 @@ async fn video_server(
 
     let mut encoder: Option<Encoder> = None;
     let mut position = Time::zero();
-    let duration: Time = Time::from_nth_of_a_second(33);
+    let duration: Time = Time::from_nth_of_a_second(66);
 
     loop {
         let mut buf = [0; 65536];
@@ -132,7 +132,7 @@ async fn video_server(
 }
 
 fn control_modifier(x: f32) -> f32 {
-    (x.powi(2) * x.signum() * 0.9 + x * 0.1) * PI * 3.0
+    (x.powi(2) * x.signum() * 0.8 + x * 0.2) * PI * 1.5
 }
 
 async fn track_events(
@@ -162,7 +162,7 @@ async fn track_events(
                 control.lock().unwrap().yaw = -control_modifier(normalized_val);
             }
             Event::Throttle(t) => {
-                // info!("throttle {}", t);
+                info!("throttle {}", t);
                 control.lock().unwrap().throttle = (1.0 - t) as f32;
             }
             _ => {}
