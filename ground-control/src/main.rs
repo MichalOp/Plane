@@ -42,7 +42,7 @@ async fn video_server(
 
     let mut encoder: Option<Encoder> = None;
     let mut position = Time::zero();
-    let duration: Time = Time::from_nth_of_a_second(66);
+    let duration: Time = Time::from_nth_of_a_second(33);
 
     loop {
         let mut buf = [0; 65536];
@@ -143,6 +143,8 @@ async fn track_events(
     let mut controller = controller;
     loop {
         let event = (&mut controller).await;
+
+        // info!("{:?}", event);
         match event {
             Event::Trigger(x) => {
                 if x {
@@ -154,16 +156,16 @@ async fn track_events(
                 control.lock().unwrap().roll = control_modifier(x as f32);
             }
             Event::JoyY(y) => {
-                control.lock().unwrap().pitch = control_modifier(y as f32);
+                control.lock().unwrap().pitch = -control_modifier(y as f32);
             }
-            Event::CamZ(z) => {
+            Event::CamX(z) => {
                 // info!("yaw {}", y);
-                let normalized_val = ((z + 0.9843740462674724) / (1.0 - 0.9843740462674724)) as f32;
-                control.lock().unwrap().yaw = -control_modifier(normalized_val);
+                // let normalized_val = ((z + 0.9843740462674724) / (1.0 - 0.9843740462674724)) as f32;
+                control.lock().unwrap().yaw = -control_modifier(z as f32);
             }
-            Event::Throttle(t) => {
+            Event::JoyZ(t) => {
                 info!("throttle {}", t);
-                control.lock().unwrap().throttle = (1.0 - t) as f32;
+                control.lock().unwrap().throttle = t as f32 / 2.0 + 0.5;
             }
             _ => {}
         }
@@ -206,11 +208,16 @@ async fn tokio_main(buffer: Arc<Mutex<DisplayData>>) -> anyhow::Result<()> {
     loop {
         let controller = (&mut listener).await;
         println!("{:?}", controller);
-        if controller.name() == "Thrustmaster T.16000M" {
+        if controller.name() == "EdgeTX Radiomaster Pocket Joystick" {
             let control = control.clone();
             let buffer = buffer.clone();
             tokio::task::spawn(async move { track_events(controller, control, buffer).await });
         }
+        // if controller.name() == "Thrustmaster T.16000M" {
+        //     let control = control.clone();
+        //     let buffer = buffer.clone();
+        //     tokio::task::spawn(async move { track_events(controller, control, buffer).await });
+        // }
     }
 }
 

@@ -106,7 +106,7 @@ impl Packets {
             }
         });
         let remainder = self.0.split_off(len_to_parse as usize);
-        let mut output_vec: Vec<u8> = self.0.iter().flat_map(|x| x.buf).collect();
+        let output_vec: Vec<u8> = self.0.iter().flat_map(|x| x.buf).collect();
         self.0 = remainder;
         if first_id % 100 == 0 {
             println!("received {}", first_id);

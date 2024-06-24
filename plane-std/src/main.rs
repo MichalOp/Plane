@@ -98,10 +98,11 @@ impl Controller for QuadController<'_> {
 
         let [pitch, roll, yaw] = control_outputs;
 
-        let left_front = pitch + roll + yaw;
-        let left_back = -pitch + roll - yaw;
-        let right_front = pitch - roll - yaw;
-        let right_back = -pitch - roll + yaw;
+        let yaw_flip = -1.0;
+        let left_front = pitch + roll + yaw_flip * yaw;
+        let left_back = -pitch + roll - yaw_flip * yaw;
+        let right_front = pitch - roll - yaw_flip * yaw;
+        let right_back = -pitch - roll + yaw_flip * yaw;
 
         let control_max = [left_front, right_front, left_back, right_back]
             .iter()
@@ -133,7 +134,7 @@ impl Controller for QuadController<'_> {
             .unwrap();
 
         // println!(
-        //     "{:03} {:03}\n{:03} {:03}",
+        //     "{:03} {:03} {:03} {:03}",
         //     left_front, right_front, left_back, right_back
         // );
     }
@@ -146,6 +147,7 @@ fn build_quad_controller<'a>(
     right_back: LedcDriver<'a>,
     imu: lsm6dso::Lsm6dso<I2cDriver<'a>>,
 ) -> QuadController<'a> {
+    sleep(Duration::from_secs_f32(1.0));
     let mut imu = imu;
     let rates_zero: [f32; 3] = imu.read_gyro().unwrap().into();
     eprint!("zero rates {:?}", rates_zero);
@@ -157,8 +159,8 @@ fn build_quad_controller<'a>(
         imu,
         rates_zero,
         pids: [
-            *Pid::new(0.0, 1.0).p(0.3, 1.0).d(1.5, 1.0),
-            *Pid::new(0.0, 1.0).p(0.3, 1.0).d(1.5, 1.0),
+            *Pid::new(0.0, 1.0).p(0.25, 1.0).d(1.5, 1.0),
+            *Pid::new(0.0, 1.0).p(0.25, 1.0).d(1.5, 1.0),
             *Pid::new(0.0, 1.0).p(0.5, 1.0).d(0.5, 1.0),
         ],
     };
@@ -225,7 +227,7 @@ fn command_thread(socket: Arc<UdpSocket>, controller: impl Controller) -> Result
         let current_time = SystemTime::now();
 
         let duration =
-            match (loop_start_time + Duration::from_millis(5)).duration_since(current_time) {
+            match (loop_start_time + Duration::from_millis(2)).duration_since(current_time) {
                 Ok(duration) => duration,
                 Err(time_err) => {
                     println!(
@@ -318,10 +320,10 @@ fn main() -> Result<()> {
     let mut driver = lsm6dso::Lsm6dso::new(i2cdriver, 0x6a).unwrap();
     driver.set_low_power_mode(false).unwrap();
     driver
-        .set_accelerometer_output(lsm6dso::AccelerometerOutput::Rate208)
+        .set_accelerometer_output(lsm6dso::AccelerometerOutput::Rate1_66k)
         .unwrap();
     driver
-        .set_gyroscope_output(lsm6dso::GyroscopeOutput::Rate208)
+        .set_gyroscope_output(lsm6dso::GyroscopeOutput::Rate1_66k)
         .unwrap();
     driver
         .set_gyroscope_scale(lsm6dso::GyroscopeFullScale::Dps1000)
@@ -368,8 +370,8 @@ fn main() -> Result<()> {
         ledc_timer: esp_idf_sys::ledc_timer_t_LEDC_TIMER_0,
         ledc_channel: esp_idf_sys::ledc_channel_t_LEDC_CHANNEL_0,
         pixel_format: esp_idf_sys::camera::pixformat_t_PIXFORMAT_JPEG,
-        frame_size: esp_idf_sys::camera::framesize_t_FRAMESIZE_CIF,
-        jpeg_quality: 10,
+        frame_size: esp_idf_sys::camera::framesize_t_FRAMESIZE_SVGA,
+        jpeg_quality: 14,
         fb_count: 2,
         fb_location: esp_idf_sys::camera::camera_fb_location_t_CAMERA_FB_IN_PSRAM,
         grab_mode: esp_idf_sys::camera::camera_grab_mode_t_CAMERA_GRAB_WHEN_EMPTY,
