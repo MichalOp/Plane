@@ -159,7 +159,7 @@ async fn track_events(
                 control.lock().unwrap().pitch = -control_modifier(y as f32);
             }
             Event::CamX(z) => {
-                // info!("yaw {}", y);
+                info!("yaw {}", z);
                 // let normalized_val = ((z + 0.9843740462674724) / (1.0 - 0.9843740462674724)) as f32;
                 control.lock().unwrap().yaw = -control_modifier(z as f32);
             }

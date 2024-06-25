@@ -1,6 +1,7 @@
 #![feature(generic_arg_infer)]
 
 use anyhow::{bail, ensure, Result};
+use biquad::*;
 use bytemuck::{self, bytes_of, bytes_of_mut, Zeroable};
 use core::str;
 use esp_idf_hal::{
@@ -8,6 +9,7 @@ use esp_idf_hal::{
     i2c::{I2cConfig, I2cDriver},
     ledc::{LedcDriver, Resolution},
     prelude::*,
+    task::thread::ThreadSpawnConfiguration,
 };
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
@@ -15,6 +17,7 @@ use esp_idf_svc::{
         ledc::{config::TimerConfig, LedcTimerDriver},
         peripherals::Peripherals,
     },
+    timer::EspTimerService,
 };
 use esp_idf_sys::{esp_wifi_get_max_tx_power, ets_get_cpu_frequency, nvs_flash_init, ESP_OK};
 use lsm6dso;
@@ -23,7 +26,7 @@ use protocol::{self, Control, Telemetry};
 use std::{
     net::{SocketAddr, UdpSocket},
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread::sleep,
     time::{Duration, SystemTime, SystemTimeError},
 };
@@ -42,7 +45,7 @@ pub struct Config {
 }
 
 trait Controller {
-    fn set_rates(&mut self, command: Control);
+    fn set_rates(&mut self, command: Control, i: i32);
 }
 
 struct PlaneController<'a> {
@@ -54,7 +57,7 @@ struct PlaneController<'a> {
 }
 
 impl Controller for PlaneController<'_> {
-    fn set_rates(&mut self, command: Control) {
+    fn set_rates(&mut self, command: Control, _i: i32) {
         let min_duty = self.min_duty;
         let max_duty = self.max_duty;
         let pitch_value =
@@ -78,25 +81,40 @@ struct QuadController<'a> {
     right_back: LedcDriver<'a>,
     imu: lsm6dso::Lsm6dso<I2cDriver<'a>>,
     rates_zero: [f32; 3],
+    rates_current: [f32; 3],
     pids: [pid::Pid<f32>; 3],
+    filters: [DirectForm2Transposed<f32>; 3],
 }
 
 impl Controller for QuadController<'_> {
-    fn set_rates(&mut self, command: Control) {
+    fn set_rates(&mut self, command: Control, i: i32) {
         let rates: [f32; 3] = self.imu.read_gyro().unwrap().into();
         let command_rates: [f32; 3] = [command.pitch, command.roll, command.yaw];
-        let control_outputs: [f32; 3] =
-            izip!(self.pids.iter_mut(), rates, self.rates_zero, command_rates)
-                .map(|(p, rate, rate_zero, command_rate)| {
-                    p.setpoint(command_rate);
-                    let control = p.next_control_output(rate - rate_zero);
-                    control.output
-                })
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap();
+        let control_outputs: [f32; 3] = izip!(
+            self.pids.iter_mut(),
+            rates,
+            self.rates_zero,
+            self.filters.iter_mut(),
+            command_rates
+        )
+        .map(|(p, rate, rate_zero, filter, command_rate)| {
+            let rate = filter.run(rate - rate_zero);
+            p.setpoint(command_rate);
+            let control = p.next_control_output(rate);
+            control.output
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
 
         let [pitch, roll, yaw] = control_outputs;
+
+        if i % 100 == 0 {
+            println!(
+                "{:.3} {:.3} {:.3}:{:.3} {:.3} {:.3}",
+                command.pitch, command.roll, command.yaw, pitch, roll, yaw
+            );
+        }
 
         let yaw_flip = -1.0;
         let left_front = pitch + roll + yaw_flip * yaw;
@@ -134,7 +152,7 @@ impl Controller for QuadController<'_> {
             .unwrap();
 
         // println!(
-        //     "{:03} {:03} {:03} {:03}",
+        //     "{:.3} {:.3} {:.3} {:.3}",
         //     left_front, right_front, left_back, right_back
         // );
     }
@@ -149,8 +167,23 @@ fn build_quad_controller<'a>(
 ) -> QuadController<'a> {
     sleep(Duration::from_secs_f32(1.0));
     let mut imu = imu;
-    let rates_zero: [f32; 3] = imu.read_gyro().unwrap().into();
-    eprint!("zero rates {:?}", rates_zero);
+    let mut rates_zero: [f32; 3] = [0.0; 3];
+    let samples = 1000;
+    for i in 0..samples {
+        let rates: [f32; 3] = imu.read_gyro().unwrap().into();
+        rates_zero[0] += rates[0];
+        rates_zero[1] += rates[1];
+        rates_zero[2] += rates[2];
+    }
+    rates_zero.iter_mut().for_each(|x| *x /= samples as f32);
+    print!("zero rates {:?}", rates_zero);
+    // Cutoff and sampling frequencies
+    let f0 = 125.hz();
+    let fs = 1.66.khz();
+
+    // Create coefficients for the biquads
+    let coeffs =
+        Coefficients::<f32>::from_params(Type::LowPass, fs, f0, Q_BUTTERWORTH_F32).unwrap();
     let controller = QuadController {
         left_front,
         left_back,
@@ -158,10 +191,12 @@ fn build_quad_controller<'a>(
         right_back,
         imu,
         rates_zero,
+        rates_current: [0.0; 3],
+        filters: [DirectForm2Transposed::<f32>::new(coeffs); 3],
         pids: [
-            *Pid::new(0.0, 1.0).p(0.25, 1.0).d(1.5, 1.0),
-            *Pid::new(0.0, 1.0).p(0.25, 1.0).d(1.5, 1.0),
-            *Pid::new(0.0, 1.0).p(0.5, 1.0).d(0.5, 1.0),
+            *Pid::new(0.0, 1.0).p(3.0, 1.0).d(10.0, 1.0).i(0.1, 0.0),
+            *Pid::new(0.0, 1.0).p(3.0, 1.0).d(10.0, 1.0).i(0.1, 0.0),
+            *Pid::new(0.0, 1.0).p(3.0, 1.0).d(1.0, 1.0).i(0.1, 0.0),
         ],
     };
     controller
@@ -184,17 +219,14 @@ fn build_plane_controller<'a>(
     controller
 }
 
-fn command_thread(socket: Arc<UdpSocket>, controller: impl Controller) -> Result<()> {
-    let mut controller = controller;
+fn command_thread(command: Arc<Mutex<protocol::Control>>, socket: Arc<UdpSocket>) -> Result<()> {
     println!("command thread started!");
     socket
-        .set_read_timeout(Some(Duration::from_micros(1000)))
+        .set_read_timeout(Some(Duration::from_micros(2000)))
         .unwrap();
 
-    let mut command = protocol::Control::zeroed();
     let mut last_command_time = SystemTime::now();
     loop {
-        let loop_start_time = SystemTime::now();
         let mut new_command = protocol::Control::zeroed();
         let buf = bytes_of_mut(&mut new_command);
         let recv_value = socket.recv_from(buf);
@@ -204,7 +236,8 @@ fn command_thread(socket: Arc<UdpSocket>, controller: impl Controller) -> Result
         };
         let current_time = SystemTime::now();
         if ok {
-            command = new_command;
+            let mut locked = command.lock().unwrap();
+            *locked = new_command;
             last_command_time = current_time;
         };
 
@@ -214,30 +247,14 @@ fn command_thread(socket: Arc<UdpSocket>, controller: impl Controller) -> Result
             .as_secs_f32()
             > 0.2
         {
-            command = protocol::Control {
+            let mut locked = command.lock().unwrap();
+            *locked = protocol::Control {
                 pitch: 0.0,
                 roll: 0.0,
                 yaw: 0.0,
                 throttle: 0.0,
             };
         }
-
-        controller.set_rates(command);
-
-        let current_time = SystemTime::now();
-
-        let duration =
-            match (loop_start_time + Duration::from_millis(2)).duration_since(current_time) {
-                Ok(duration) => duration,
-                Err(time_err) => {
-                    println!(
-                        "Missed deadline by {} microseconds!",
-                        time_err.duration().as_micros(),
-                    );
-                    Duration::from_micros(0)
-                }
-            };
-        sleep(duration);
     }
 }
 
@@ -377,17 +394,39 @@ fn main() -> Result<()> {
         grab_mode: esp_idf_sys::camera::camera_grab_mode_t_CAMERA_GRAB_WHEN_EMPTY,
     };
 
+    let command: Arc<Mutex<protocol::Control>> = Mutex::new(protocol::Control::zeroed()).into();
+
     {
+        let command = command.clone();
         let socket = socket.clone();
-        let controller = build_quad_controller(
+        std::thread::spawn(move || command_thread(command, socket));
+    }
+    let timer_service = EspTimerService::new().unwrap();
+    let mut counter = 0;
+
+    let timer = {
+        let mut controller = build_quad_controller(
             driver_left_front,
             driver_left_back,
             driver_right_front,
             driver_right_back,
             driver,
         );
-        std::thread::spawn(move || command_thread(socket, controller));
-    }
+        let command = command.clone();
+        unsafe {
+            timer_service
+                .timer_nonstatic(move || {
+                    counter += 1;
+                    controller.set_rates(command.lock().unwrap().clone(), counter);
+                    if counter % 1000 == 0 {
+                        println!("{}", counter);
+                    }
+                })
+                .unwrap()
+        }
+    };
+
+    timer.every(Duration::from_secs_f32(1.0 / 1660.0)).unwrap();
 
     let server = SocketAddr::from_str("192.168.1.197:12892")?;
     println!("server {:?}", server);

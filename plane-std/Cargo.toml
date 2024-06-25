@@ -35,6 +35,7 @@ bytemuck = "1.15.0"
 lsm6dso = { git = "https://github.com/cameronkinsella/lsm6dso.git" }
 pid = "4.0.0"
 itertools = "0.13.0"
+biquad = "0.4.2"
 
 [[package.metadata.esp-idf-sys.extra_components]]
 component_dirs = "component/esp32-camera"
