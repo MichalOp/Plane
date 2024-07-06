@@ -15,6 +15,7 @@ pub struct Control {
 #[repr(C)]
 pub struct Telemetry {
     pub voltage: u16,
+    pub signal_strength: i16,
 }
 
 /// The packet messaging protocol.

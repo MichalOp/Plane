@@ -9,7 +9,6 @@ use esp_idf_hal::{
     i2c::{I2cConfig, I2cDriver},
     ledc::{LedcDriver, Resolution},
     prelude::*,
-    task::thread::ThreadSpawnConfiguration,
 };
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
@@ -26,7 +25,7 @@ use protocol::{self, Control, Telemetry};
 use std::{
     net::{SocketAddr, UdpSocket},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{atomic::AtomicU16, Arc, Mutex},
     thread::sleep,
     time::{Duration, SystemTime, SystemTimeError},
 };
@@ -45,7 +44,7 @@ pub struct Config {
 }
 
 trait Controller {
-    fn set_rates(&mut self, command: Control, i: i32);
+    fn set_rates(&mut self, command: Control, voltage: u16, i: i32);
 }
 
 struct PlaneController<'a> {
@@ -57,7 +56,7 @@ struct PlaneController<'a> {
 }
 
 impl Controller for PlaneController<'_> {
-    fn set_rates(&mut self, command: Control, _i: i32) {
+    fn set_rates(&mut self, command: Control, voltage: u16, _i: i32) {
         let min_duty = self.min_duty;
         let max_duty = self.max_duty;
         let pitch_value =
@@ -81,13 +80,12 @@ struct QuadController<'a> {
     right_back: LedcDriver<'a>,
     imu: lsm6dso::Lsm6dso<I2cDriver<'a>>,
     rates_zero: [f32; 3],
-    rates_current: [f32; 3],
     pids: [pid::Pid<f32>; 3],
     filters: [DirectForm2Transposed<f32>; 3],
 }
 
 impl Controller for QuadController<'_> {
-    fn set_rates(&mut self, command: Control, i: i32) {
+    fn set_rates(&mut self, command: Control, voltage: u16, i: i32) {
         let rates: [f32; 3] = self.imu.read_gyro().unwrap().into();
         let command_rates: [f32; 3] = [command.pitch, command.roll, command.yaw];
         let control_outputs: [f32; 3] = izip!(
@@ -109,12 +107,12 @@ impl Controller for QuadController<'_> {
 
         let [pitch, roll, yaw] = control_outputs;
 
-        if i % 100 == 0 {
-            println!(
-                "{:.3} {:.3} {:.3}:{:.3} {:.3} {:.3}",
-                command.pitch, command.roll, command.yaw, pitch, roll, yaw
-            );
-        }
+        // if i % 100 == 0 {
+        //     println!(
+        //         "{:.3} {:.3} {:.3}:{:.3} {:.3} {:.3}",
+        //         command.pitch, command.roll, command.yaw, pitch, roll, yaw
+        //     );
+        // }
 
         let yaw_flip = -1.0;
         let left_front = pitch + roll + yaw_flip * yaw;
@@ -127,16 +125,22 @@ impl Controller for QuadController<'_> {
             .map(|x| x.abs())
             .fold(f32::NEG_INFINITY, |a, b| a.max(b));
 
-        let normalize =
-            (control_max + 0.0001).min(command.throttle + 0.0001) / (control_max + 0.0001);
+        let scaled_throttle = command.throttle * 0.9;
+        let normalize = (control_max + 0.0001)
+            .min(scaled_throttle + 0.0001)
+            .min(1.0 - scaled_throttle + 0.0001)
+            / (control_max + 0.0001);
         // println!("normalize {}", normalize);
 
-        let scale = 0.66;
+        let voltage = voltage as f32 / 20816.4; // 5700.0 * 0.66 * ((150.0 + 680.0) / (150.0));
+        let voltage_scaling = 3.5 / voltage.max(2.5);
+        let scaled_throttle = scaled_throttle * voltage_scaling;
+        let normalize = normalize * voltage_scaling;
 
-        let left_front = (command.throttle + left_front * normalize) * scale;
-        let left_back = (command.throttle + left_back * normalize) * scale;
-        let right_back = (command.throttle + right_back * normalize) * scale;
-        let right_front = (command.throttle + right_front * normalize) * scale;
+        let left_front = scaled_throttle + left_front * normalize;
+        let left_back = scaled_throttle + left_back * normalize;
+        let right_back = scaled_throttle + right_back * normalize;
+        let right_front = scaled_throttle + right_front * normalize;
 
         self.left_front
             .set_duty((left_front.clamp(0.0, 1.0) * 255.0).round() as u32)
@@ -191,11 +195,10 @@ fn build_quad_controller<'a>(
         right_back,
         imu,
         rates_zero,
-        rates_current: [0.0; 3],
         filters: [DirectForm2Transposed::<f32>::new(coeffs); 3],
         pids: [
-            *Pid::new(0.0, 1.0).p(3.0, 1.0).d(10.0, 1.0).i(0.1, 0.0),
-            *Pid::new(0.0, 1.0).p(3.0, 1.0).d(10.0, 1.0).i(0.1, 0.0),
+            *Pid::new(0.0, 1.0).p(4.0, 1.0).d(15.0, 1.0).i(0.1, 0.0),
+            *Pid::new(0.0, 1.0).p(4.0, 1.0).d(15.0, 1.0).i(0.1, 0.0),
             *Pid::new(0.0, 1.0).p(3.0, 1.0).d(1.0, 1.0).i(0.1, 0.0),
         ],
     };
@@ -356,7 +359,7 @@ fn main() -> Result<()> {
     };
 
     // Connect to the Wi-Fi network
-    let _wifi = wifi(
+    let mut wifi = wifi(
         app_config.wifi_ssid,
         app_config.wifi_psk,
         peripherals.modem,
@@ -387,13 +390,14 @@ fn main() -> Result<()> {
         ledc_timer: esp_idf_sys::ledc_timer_t_LEDC_TIMER_0,
         ledc_channel: esp_idf_sys::ledc_channel_t_LEDC_CHANNEL_0,
         pixel_format: esp_idf_sys::camera::pixformat_t_PIXFORMAT_JPEG,
-        frame_size: esp_idf_sys::camera::framesize_t_FRAMESIZE_SVGA,
-        jpeg_quality: 14,
+        frame_size: esp_idf_sys::camera::framesize_t_FRAMESIZE_CIF,
+        jpeg_quality: 10,
         fb_count: 2,
         fb_location: esp_idf_sys::camera::camera_fb_location_t_CAMERA_FB_IN_PSRAM,
         grab_mode: esp_idf_sys::camera::camera_grab_mode_t_CAMERA_GRAB_WHEN_EMPTY,
     };
 
+    let voltage: Arc<AtomicU16> = Arc::new(u16::MAX.into());
     let command: Arc<Mutex<protocol::Control>> = Mutex::new(protocol::Control::zeroed()).into();
 
     {
@@ -403,6 +407,7 @@ fn main() -> Result<()> {
     }
     let timer_service = EspTimerService::new().unwrap();
     let mut counter = 0;
+    let start = SystemTime::now();
 
     let timer = {
         let mut controller = build_quad_controller(
@@ -413,13 +418,24 @@ fn main() -> Result<()> {
             driver,
         );
         let command = command.clone();
+        let voltage = voltage.clone();
         unsafe {
             timer_service
                 .timer_nonstatic(move || {
                     counter += 1;
-                    controller.set_rates(command.lock().unwrap().clone(), counter);
-                    if counter % 1000 == 0 {
-                        println!("{}", counter);
+                    controller.set_rates(
+                        command.lock().unwrap().clone(),
+                        voltage.load(std::sync::atomic::Ordering::Relaxed),
+                        counter,
+                    );
+                    if counter % 1660 == 0 {
+                        println!(
+                            "{}",
+                            SystemTime::now()
+                                .duration_since(start)
+                                .unwrap()
+                                .as_secs_f32()
+                        );
                     }
                 })
                 .unwrap()
@@ -441,9 +457,12 @@ fn main() -> Result<()> {
     let mut tprev = SystemTime::now();
     let mut avg_capture = 0.0;
     let mut avg_send = 0.0;
+    let mut signal_strength = 0;
 
+    let driver = wifi.driver_mut();
     loop {
         let t1 = SystemTime::now();
+
         let fb = unsafe { esp_idf_sys::camera::esp_camera_fb_get() };
         let data = unsafe { std::slice::from_raw_parts((*fb).buf, (*fb).len) };
 
@@ -453,10 +472,17 @@ fn main() -> Result<()> {
         for _ in 0..10 {
             v += adc.read(&mut adc_pin).unwrap_or_default();
         }
+
+        let v_c = voltage.load(std::sync::atomic::Ordering::Relaxed);
+        let v_c = ((v_c as u32 * 19 + v as u32) / 20) as u16;
         // let tadc = SystemTime::now();
         // println!("ADC time: {}", tadc.duration_since(t2).unwrap().as_micros());
+        let tele = Telemetry {
+            voltage: v_c,
+            signal_strength,
+        };
 
-        let tele = Telemetry { voltage: v };
+        voltage.store(v_c, std::sync::atomic::Ordering::Relaxed);
 
         let data_vec: Vec<u8> = bytes_of(&tele)
             .iter()
@@ -474,6 +500,7 @@ fn main() -> Result<()> {
         avg_capture += t2.duration_since(t1).unwrap_or_default().as_secs_f32();
         avg_send += t3.duration_since(t2).unwrap_or_default().as_secs_f32();
         if message_id % 100 == 0 {
+            signal_strength = driver.get_ap_info()?.signal_strength as i16;
             let tnow = SystemTime::now();
             println!(
                 "id: {} capture: {} send: {} FPS: {}",

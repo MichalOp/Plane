@@ -12,6 +12,7 @@ use anyhow;
 use bytemuck::{bytes_of, bytes_of_mut, Zeroable};
 use eframe::egui;
 use egui::{Color32, TextureHandle};
+use image::imageops::flip_vertical;
 use ndarray::Array3;
 use protocol::{Control, Telemetry};
 use stick::{Controller, Event, Listener};
@@ -42,7 +43,7 @@ async fn video_server(
 
     let mut encoder: Option<Encoder> = None;
     let mut position = Time::zero();
-    let duration: Time = Time::from_nth_of_a_second(33);
+    let duration: Time = Time::from_nth_of_a_second(66);
 
     loop {
         let mut buf = [0; 65536];
@@ -63,6 +64,7 @@ async fn video_server(
                 continue;
             }
             let img = img.unwrap();
+            // let img = flip_vertical(&img);
             let mut locked = buffer.lock().unwrap();
 
             *locked = DisplayData {
@@ -290,6 +292,12 @@ impl MyEguiApp {
 
 impl eframe::App for MyEguiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.input(|x| {
+            if x.key_pressed(egui::Key::Space) {
+                let mut locked_display_info = self.display_info.lock().unwrap();
+                locked_display_info.recording = !locked_display_info.recording;
+            }
+        });
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut locked_display_info = self.display_info.lock().unwrap();
             self.texture
@@ -297,10 +305,11 @@ impl eframe::App for MyEguiApp {
             let v = locked_display_info.telemetry.voltage / 10;
             let voltage = v as f32 / 570.0 * 0.66 * ((150.0 + 680.0) / (150.0));
             locked_display_info.voltage_avg =
-                locked_display_info.voltage_avg * 0.95 + voltage * 0.05;
+                locked_display_info.voltage_avg * 0.0 + voltage * 1.00;
             ui.heading(format!(
-                "{:.02}V            {}",
+                "{:.02}V  {}dB          {}",
                 locked_display_info.voltage_avg,
+                locked_display_info.telemetry.signal_strength,
                 if locked_display_info.recording {
                     "RECORDING"
                 } else {
