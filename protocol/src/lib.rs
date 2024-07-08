@@ -9,13 +9,16 @@ pub struct Control {
     pub pitch: f32,
     pub yaw: f32,
     pub throttle: f32,
+    pub timestamp: u64,
 }
 
 #[derive(Clone, Copy, Zeroable, Pod, Debug)]
 #[repr(C)]
 pub struct Telemetry {
+    pub timestamp: u64,
     pub voltage: u16,
     pub signal_strength: i16,
+    pub pad: i32,
 }
 
 /// The packet messaging protocol.

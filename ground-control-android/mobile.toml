@@ -1,0 +1,5 @@
+[app]
+name = "ground-control-android"
+stylized-name = "Ground Control Android"
+identifier = "example.com"
+template-pack = "egui"

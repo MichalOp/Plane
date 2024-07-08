@@ -56,7 +56,7 @@ struct PlaneController<'a> {
 }
 
 impl Controller for PlaneController<'_> {
-    fn set_rates(&mut self, command: Control, voltage: u16, _i: i32) {
+    fn set_rates(&mut self, command: Control, _voltage: u16, _i: i32) {
         let min_duty = self.min_duty;
         let max_duty = self.max_duty;
         let pitch_value =
@@ -252,6 +252,7 @@ fn command_thread(command: Arc<Mutex<protocol::Control>>, socket: Arc<UdpSocket>
         {
             let mut locked = command.lock().unwrap();
             *locked = protocol::Control {
+                timestamp: 0,
                 pitch: 0.0,
                 roll: 0.0,
                 yaw: 0.0,
@@ -478,8 +479,10 @@ fn main() -> Result<()> {
         // let tadc = SystemTime::now();
         // println!("ADC time: {}", tadc.duration_since(t2).unwrap().as_micros());
         let tele = Telemetry {
+            timestamp: command.lock().unwrap().timestamp,
             voltage: v_c,
             signal_strength,
+            pad: 0,
         };
 
         voltage.store(v_c, std::sync::atomic::Ordering::Relaxed);

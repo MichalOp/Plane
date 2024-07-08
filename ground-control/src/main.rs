@@ -5,13 +5,14 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow;
 use bytemuck::{bytes_of, bytes_of_mut, Zeroable};
 use eframe::egui;
 use egui::{Color32, TextureHandle};
+use env_logger::fmt::Timestamp;
 use image::imageops::flip_vertical;
 use ndarray::Array3;
 use protocol::{Control, Telemetry};
@@ -27,9 +28,11 @@ use video_rs::encode::{Encoder, Settings};
 use video_rs::time::Time;
 
 struct DisplayData {
+    start_timestamp: SystemTime,
     image_data: egui::ImageData,
     telemetry: Telemetry,
     voltage_avg: f32,
+    actual_loop_time: f32,
     recording: bool,
 }
 
@@ -45,12 +48,20 @@ async fn video_server(
     let mut position = Time::zero();
     let duration: Time = Time::from_nth_of_a_second(66);
 
+    let mut actual_loop_time = 0.0;
+    let mut system_time = SystemTime::now();
+
     loop {
         let mut buf = [0; 65536];
         let (amt, src) = socket.recv_from(&mut buf).await.unwrap();
         *plane_ip.lock().unwrap() = Some(src);
         if amt > 0 {
             // info!("Parsing! {}", payload.len());
+
+            let newtime = SystemTime::now();
+            actual_loop_time = actual_loop_time * 0.9
+                + 0.1 * newtime.duration_since(system_time).unwrap().as_secs_f32();
+            system_time = newtime;
 
             let mut telemetry = Telemetry::zeroed();
 
@@ -68,6 +79,7 @@ async fn video_server(
             let mut locked = buffer.lock().unwrap();
 
             *locked = DisplayData {
+                start_timestamp: locked.start_timestamp,
                 image_data: egui::ImageData::Color(
                     egui::ColorImage {
                         size: [img.width() as usize, img.height() as usize],
@@ -79,6 +91,7 @@ async fn video_server(
                     .into(),
                 ),
                 telemetry,
+                actual_loop_time,
                 recording: locked.recording,
                 voltage_avg: locked.voltage_avg,
             };
@@ -178,14 +191,20 @@ async fn send_command(
     socket: Arc<UdpSocket>,
     control: Arc<Mutex<Control>>,
     plane_ip: Arc<Mutex<Option<SocketAddr>>>,
+    start_time: SystemTime,
 ) -> anyhow::Result<()> {
-    let mut interval = time::interval(Duration::from_millis(10));
+    let mut interval = time::interval(Duration::from_millis(20));
     loop {
         interval.tick().await;
         let ip = plane_ip.lock().unwrap().clone();
         if let Some(ip) = ip {
             let bytes_to_send: Vec<u8> = {
-                let lock = control.lock().unwrap();
+                let mut lock = control.lock().unwrap();
+                let timestamp = SystemTime::now()
+                    .duration_since(start_time)
+                    .unwrap()
+                    .as_micros() as u64;
+                lock.timestamp = timestamp;
                 bytes_of(&*lock).to_vec()
             };
             socket.send_to(&bytes_to_send, ip).await?;
@@ -202,7 +221,8 @@ async fn tokio_main(buffer: Arc<Mutex<DisplayData>>) -> anyhow::Result<()> {
         let control = control.clone();
         let plane_ip = plane_ip.clone();
         let socket = socket.clone();
-        tokio::task::spawn(async move { send_command(socket, control, plane_ip).await });
+        let timestamp = buffer.lock().unwrap().start_timestamp;
+        tokio::task::spawn(async move { send_command(socket, control, plane_ip, timestamp).await });
     }
     let buffer_cloned = buffer.clone();
     tokio::task::spawn(async move { video_server(socket, buffer_cloned, plane_ip).await });
@@ -241,10 +261,12 @@ fn main() {
     tracing::subscriber::set_global_default(tracing_subscriber::FmtSubscriber::new())
         .expect("setting tracing default failed");
     let buffer = Arc::new(Mutex::new(DisplayData {
+        start_timestamp: SystemTime::now(),
         image_data: make_debug_image(),
         telemetry: Telemetry::zeroed(),
         voltage_avg: 0.0,
         recording: false,
+        actual_loop_time: 0.0,
     }));
     let buffer_cloned = buffer.clone();
 
@@ -304,12 +326,19 @@ impl eframe::App for MyEguiApp {
                 .set(locked_display_info.image_data.clone(), Default::default());
             let v = locked_display_info.telemetry.voltage / 10;
             let voltage = v as f32 / 570.0 * 0.66 * ((150.0 + 680.0) / (150.0));
+            let roundtrip = SystemTime::now()
+                .duration_since(locked_display_info.start_timestamp)
+                .unwrap()
+                .as_micros() as u64
+                - locked_display_info.telemetry.timestamp;
             locked_display_info.voltage_avg =
                 locked_display_info.voltage_avg * 0.0 + voltage * 1.00;
             ui.heading(format!(
-                "{:.02}V  {}dB          {}",
+                "{:.02}V  {}dB      {:.02}FPS      {}ms    {}",
                 locked_display_info.voltage_avg,
                 locked_display_info.telemetry.signal_strength,
+                1.0 / locked_display_info.actual_loop_time,
+                roundtrip / 1000,
                 if locked_display_info.recording {
                     "RECORDING"
                 } else {
