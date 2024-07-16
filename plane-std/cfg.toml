@@ -1,3 +1,7 @@
 [plane-std]
-wifi_ssid = "SwissJejuXD"
-wifi_psk = "StaraWierzbaS1piewa$"
+# wifi_ssid = "SwissJejuXD"
+# wifi_psk = "StaraWierzbaS1piewa$"
+# wifi_ssid = "SiećDoRobieniaASKa"
+# wifi_psk = "vvzn6268"
+wifi_ssid = "quadtest"
+wifi_psk = "vvzn62681"

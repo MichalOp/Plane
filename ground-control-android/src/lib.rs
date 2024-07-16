@@ -1,190 +1,457 @@
-#[cfg(target_os = "android")]
-use winit::platform::android::activity::AndroidApp;
+//#[cfg(target_os = "android")]
+// use winit::platform::android::activity::AndroidApp;
 
-use winit::event::Event::*;
-use winit::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopWindowTarget};
+use std::{
+    f32::consts::PI,
+    io::Cursor,
+    mem::size_of,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, SystemTime},
+};
 
-use egui_wgpu::winit::Painter;
-use egui_winit::State;
+use anyhow;
+use bytemuck::{bytes_of, bytes_of_mut, Zeroable};
+use eframe::egui::{self, Event};
+use egui::{Color32, TextureHandle, Vec2};
+use image::io::Reader as ImageReader;
+use image::{imageops::flip_vertical, DynamicImage};
+use local_ip_address::list_afinet_netifas;
+use ndarray::Array3;
+use protocol::{Control, Telemetry};
+use sscanf;
+use stick;
+use stick::{Controller, Listener};
+use tokio::net::UdpSocket;
+use tokio::time;
+use tracing::{info, warn};
+// use turbojpeg;
 
-const INITIAL_WIDTH: u32 = 1920;
-const INITIAL_HEIGHT: u32 = 1080;
+use chrono::{DateTime, Local};
+use winit::platform::android::EventLoopBuilderExtAndroid;
 
-/// A custom event type for the winit app.
-enum Event {
-    RequestRedraw,
-}
-
-/// Enable egui to request redraws via a custom Winit event...
 #[derive(Clone)]
-struct RepaintSignal(std::sync::Arc<std::sync::Mutex<winit::event_loop::EventLoopProxy<Event>>>);
-
-fn create_window<T>(
-    event_loop: &EventLoopWindowTarget<T>,
-    state: &mut State,
-    painter: &mut Painter,
-) -> winit::window::Window {
-    let window = winit::window::WindowBuilder::new()
-        .with_decorations(true)
-        .with_resizable(true)
-        .with_transparent(false)
-        .with_title("egui winit + wgpu example")
-        .with_inner_size(winit::dpi::PhysicalSize {
-            width: INITIAL_WIDTH,
-            height: INITIAL_HEIGHT,
-        })
-        .build(event_loop)
-        .unwrap();
-
-    pollster::block_on(painter.set_window(Some(&window))).unwrap();
-
-    // NB: calling set_window will lazily initialize render state which
-    // means we will be able to query the maximum supported texture
-    // dimensions
-    if let Some(max_size) = painter.max_texture_side() {
-        state.set_max_texture_side(max_size);
-    }
-
-    let pixels_per_point = window.scale_factor() as f32;
-    state.set_pixels_per_point(pixels_per_point);
-
-    window.request_redraw();
-
-    window
+struct DisplayData {
+    start_timestamp: SystemTime,
+    image_data: egui::ImageData,
+    telemetry: Telemetry,
+    voltage_avg: f32,
+    actual_loop_time: f32,
+    recording: bool,
 }
 
-fn _main(event_loop: EventLoop<Event>) {
-    let ctx = egui::Context::default();
-    let repaint_signal = RepaintSignal(std::sync::Arc::new(std::sync::Mutex::new(
-        event_loop.create_proxy(),
-    )));
-    ctx.set_request_repaint_callback(move |_| {
-        repaint_signal
-            .0
-            .lock()
-            .unwrap()
-            .send_event(Event::RequestRedraw)
-            .ok();
-    });
+async fn video_server(
+    socket: Arc<UdpSocket>,
+    buffer: Arc<Mutex<DisplayData>>,
+    plane_ip: Arc<Mutex<Option<SocketAddr>>>,
+) -> anyhow::Result<()> {
+    // Receives a single datagram message on the socket. If `buf` is too small to hold
+    // the message, it will be cut off.
 
-    let mut state = State::new(&event_loop);
-    let mut painter = Painter::new(
-        egui_wgpu::WgpuConfiguration::default(),
-        1, // msaa samples
-        None,
-        false,
-    );
-    let mut window: Option<winit::window::Window> = None;
-    let mut egui_demo_windows = egui_demo_lib::DemoWindows::default();
+    let mut actual_loop_time = 0.0;
+    let mut system_time = SystemTime::now();
 
-    event_loop.run(move |event, event_loop, control_flow| match event {
-        Resumed => match window {
-            None => {
-                window = Some(create_window(event_loop, &mut state, &mut painter));
+    loop {
+        let mut buf = [0; 65536];
+        let (amt, src) = socket.recv_from(&mut buf).await.unwrap();
+        *plane_ip.lock().unwrap() = Some(src);
+        if amt > 0 {
+            let newtime = SystemTime::now();
+            actual_loop_time = actual_loop_time * 0.9
+                + 0.1 * newtime.duration_since(system_time).unwrap().as_secs_f32();
+            system_time = newtime;
+
+            // let t1 = SystemTime::now();
+            let mut telemetry = Telemetry::zeroed();
+
+            let tele_buf = bytes_of_mut(&mut telemetry);
+            tele_buf.clone_from_slice(&buf[..size_of::<Telemetry>()]);
+
+            let image_buf = &buf[size_of::<Telemetry>()..];
+            // let img: Result<image::RgbImage, _> = turbojpeg::decompress_image(image_buf);
+            let mut image = ImageReader::new(Cursor::new(image_buf));
+            image.set_format(image::ImageFormat::Jpeg);
+            let img: Result<DynamicImage, _> = image.decode();
+            // info!("decode {}us", t1.elapsed().unwrap().as_micros());
+            if img.is_err() {
+                warn!("eh {}", img.err().unwrap());
+                continue;
             }
-            Some(ref window) => {
-                pollster::block_on(painter.set_window(Some(window))).unwrap();
-                window.request_redraw();
-            }
-        },
-        Suspended => {
-            window = None;
+            let img = if let DynamicImage::ImageRgb8(img) = img.unwrap() {
+                img
+            } else {
+                anyhow::bail!("wrong format");
+            };
+            // let img = flip_vertical(&img);
+
+            // let t1 = SystemTime::now();
+            let mut locked = buffer.lock().unwrap();
+
+            // info!("lock {}us", t1.elapsed().unwrap().as_micros());
+
+            // let t1 = SystemTime::now();
+            *locked = DisplayData {
+                start_timestamp: locked.start_timestamp,
+                image_data: egui::ImageData::Color(
+                    egui::ColorImage {
+                        size: [img.width() as usize, img.height() as usize],
+                        pixels: img
+                            .pixels()
+                            .map(|x| Color32::from_rgb(x.0[0], x.0[1], x.0[2]))
+                            .collect(),
+                    }
+                    .into(),
+                ),
+                telemetry,
+                actual_loop_time,
+                recording: locked.recording,
+                voltage_avg: locked.voltage_avg,
+            };
+            // info!("write {}us", t1.elapsed().unwrap().as_micros());
+            let recording = locked.recording;
+            drop(locked);
         }
-        RedrawRequested(..) => {
-            if let Some(window) = window.as_ref() {
-                let raw_input = state.take_egui_input(window);
+    }
+}
 
-                let full_output = ctx.run(raw_input, |ctx| {
-                    egui_demo_windows.ui(ctx);
+fn control_modifier(x: f32) -> f32 {
+    (x.powi(2) * x.signum() * 0.8 + x * 0.2) * PI * 1.5
+}
+
+async fn track_events(
+    controller: Controller,
+    control: Arc<Mutex<Control>>,
+    display_data: Arc<Mutex<DisplayData>>,
+) {
+    let mut controller = controller;
+    loop {
+        let event = (&mut controller).await;
+
+        warn!("{:?}", event);
+        log::warn!("{:?}", event);
+        match event {
+            stick::Event::Trigger(x) => {
+                if x {
+                    let mut d = display_data.lock().unwrap();
+                    d.recording = !d.recording;
+                }
+            }
+            stick::Event::JoyX(x) => {
+                control.lock().unwrap().roll = control_modifier(x as f32);
+            }
+            stick::Event::JoyY(y) => {
+                control.lock().unwrap().pitch = -control_modifier(y as f32);
+            }
+            stick::Event::CamX(z) => {
+                warn!("yaw {}", z);
+                // let normalized_val = ((z + 0.9843740462674724) / (1.0 - 0.9843740462674724)) as f32;
+                control.lock().unwrap().yaw = -control_modifier(z as f32);
+            }
+            stick::Event::JoyZ(t) => {
+                warn!("throttle {}", t);
+                control.lock().unwrap().throttle = t as f32 / 2.0 + 0.5;
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn send_command(
+    socket: Arc<UdpSocket>,
+    control: Arc<Mutex<Control>>,
+    plane_ip: Arc<Mutex<Option<SocketAddr>>>,
+    start_time: SystemTime,
+) -> anyhow::Result<()> {
+    let mut interval = time::interval(Duration::from_millis(20));
+    loop {
+        interval.tick().await;
+        let ip = plane_ip.lock().unwrap().clone();
+        if let Some(ip) = ip {
+            let bytes_to_send: Vec<u8> = {
+                let mut lock = control.lock().unwrap();
+                let timestamp = SystemTime::now()
+                    .duration_since(start_time)
+                    .unwrap()
+                    .as_micros() as u64;
+                lock.timestamp = timestamp;
+                bytes_of(&*lock).to_vec()
+            };
+            socket.send_to(&bytes_to_send, ip).await?;
+        }
+    }
+}
+
+async fn tokio_main(
+    buffer: Arc<Mutex<DisplayData>>,
+    control: Arc<Mutex<Control>>,
+) -> anyhow::Result<()> {
+    let plane_ip: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:12892").await.unwrap());
+
+    {
+        let control = control.clone();
+        let plane_ip = plane_ip.clone();
+        let socket = socket.clone();
+        let timestamp = buffer.lock().unwrap().start_timestamp;
+        tokio::task::spawn(async move { send_command(socket, control, plane_ip, timestamp).await });
+    }
+    let buffer_cloned = buffer.clone();
+    let task =
+        tokio::task::spawn(async move { video_server(socket, buffer_cloned, plane_ip).await });
+
+    task.await?;
+    Ok(())
+    // let mut listener = Listener::default();
+    // loop {
+    //     let controller = (&mut listener).await;
+    //     println!("{:?}", controller);
+    //     if controller.name() == "EdgeTX Radiomaster Pocket Joystick" {
+    //         let control = control.clone();
+    //         let buffer = buffer.clone();
+    //         tokio::task::spawn(async move { track_events(controller, control, buffer).await });
+    //     }
+    //     // if controller.name() == "Thrustmaster T.16000M" {
+    //     //     let control = control.clone();
+    //     //     let buffer = buffer.clone();
+    //     //     tokio::task::spawn(async move { track_events(controller, control, buffer).await });
+    //     // }
+    // }
+}
+
+fn make_debug_image() -> egui::ImageData {
+    let size = [800, 600];
+    let mut pixels = Vec::new();
+    for i in 0..size[0] {
+        for j in 0..size[1] {
+            let color = Color32::from_rgb(i as u8, j as u8, 0);
+            pixels.push(color);
+        }
+    }
+    let image = egui::ColorImage { size, pixels };
+    egui::ImageData::Color(image.into())
+}
+
+struct MyEguiApp {
+    display_info: Arc<Mutex<DisplayData>>,
+    control: Arc<Mutex<Control>>,
+    texture: TextureHandle,
+    armed: bool,
+    i: u32,
+}
+
+impl MyEguiApp {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        display_info: Arc<Mutex<DisplayData>>,
+        control: Arc<Mutex<Control>>,
+    ) -> Self {
+        // Customize egui here with cc.egui_ctx.set_fonts and cc.egui_ctx.set_visuals.
+        // Restore app state using cc.storage (requires the "persistence" feature).
+        // Use the cc.gl (a glow::Context) to create graphics shaders and buffers that you can use
+        // for e.g. egui::PaintCallback.
+        let texture = cc
+            .egui_ctx
+            .load_texture("display", make_debug_image(), Default::default());
+
+        Self {
+            display_info,
+            control,
+            texture,
+            i: 0,
+            armed: false,
+        }
+    }
+}
+
+impl eframe::App for MyEguiApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let t = SystemTime::now();
+        if !self.armed {
+            let mut control = self.control.lock().unwrap();
+            control.throttle = 0.0;
+            control.roll = 0.0;
+            control.pitch = 0.0;
+            control.yaw = 0.0;
+        }
+        ctx.input(|x| {
+            if self.armed {
+                for event in x.events.iter() {
+                    if let egui::Event::Text(text) = event {
+                        let (axis_id, value) = sscanf::sscanf!(text, "{} {}", u32, f64).unwrap();
+                        match axis_id {
+                            0 => {
+                                self.control.lock().unwrap().roll = control_modifier(value as f32);
+                            }
+                            1 => {
+                                self.control.lock().unwrap().pitch =
+                                    -control_modifier(value as f32);
+                            }
+                            13 => {
+                                // warn!("yaw {}", z);
+                                // let normalized_val = ((z + 0.9843740462674724) / (1.0 - 0.9843740462674724)) as f32;
+                                self.control.lock().unwrap().yaw = -control_modifier(value as f32);
+                            }
+                            12 => {
+                                // warn!("throttle {}", t);
+                                self.control.lock().unwrap().throttle = value as f32 / 2.0 + 0.5;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            if x.key_pressed(egui::Key::Space) {
+                let mut locked_display_info = self.display_info.lock().unwrap();
+                locked_display_info.recording = !locked_display_info.recording;
+            }
+        });
+        let mut arm_state = self.armed;
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                let mut locked_display_info = self.display_info.lock().unwrap();
+                let v = locked_display_info.telemetry.voltage / 10;
+                let voltage = v as f32 / 570.0 * 0.66 * ((150.0 + 680.0) / (150.0));
+                locked_display_info.voltage_avg =
+                    locked_display_info.voltage_avg * 0.0 + voltage * 1.00;
+                let display_info = locked_display_info.clone();
+                drop(locked_display_info);
+                self.texture
+                    .set(display_info.image_data.clone(), Default::default());
+                let roundtrip = SystemTime::now()
+                    .duration_since(display_info.start_timestamp)
+                    .unwrap()
+                    .as_micros() as u64
+                    - display_info.telemetry.timestamp;
+                ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.style_mut()
+                            .text_styles
+                            .get_mut(&egui::TextStyle::Button)
+                            .unwrap()
+                            .size = 48.0;
+                        ui.checkbox(&mut arm_state, "Arm");
+                    });
+                    ui.heading(format!(
+                        "{:.02}V\n{}dB\n{:.02}FPS\n{}ms\n{}",
+                        display_info.voltage_avg,
+                        display_info.telemetry.signal_strength,
+                        1.0 / display_info.actual_loop_time,
+                        roundtrip / 1000,
+                        if display_info.recording {
+                            "RECORDING"
+                        } else {
+                            ""
+                        }
+                    ));
                 });
-                state.handle_platform_output(window, &ctx, full_output.platform_output);
-
-                painter.paint_and_update_textures(
-                    state.pixels_per_point(),
-                    egui::Rgba::default().to_array(),
-                    &ctx.tessellate(full_output.shapes),
-                    &full_output.textures_delta,
-                    false,
-                );
-
-                if full_output.repaint_after.is_zero() {
-                    window.request_redraw();
-                }
-            }
-        }
-        MainEventsCleared | UserEvent(Event::RequestRedraw) => {
-            if let Some(window) = window.as_ref() {
-                window.request_redraw();
-            }
-        }
-        WindowEvent { event, .. } => {
-            match event {
-                winit::event::WindowEvent::Resized(size) => {
-                    painter.on_window_resized(size.width, size.height);
-                }
-                winit::event::WindowEvent::CloseRequested => {
-                    *control_flow = ControlFlow::Exit;
-                }
-                _ => {}
-            }
-
-            let response = state.on_event(&ctx, &event);
-            if response.repaint {
-                if let Some(window) = window.as_ref() {
-                    window.request_redraw();
-                }
-            }
-        }
-        _ => (),
-    });
-}
-
-#[cfg(any(target_os = "ios", target_os = "android"))]
-fn stop_unwind<F: FnOnce() -> T, T>(f: F) -> T {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-        Ok(t) => t,
-        Err(err) => {
-            eprintln!("attempt to unwind out of `rust` with err: {:?}", err);
-            std::process::abort()
-        }
+                ui.centered_and_justified(|ui| {
+                    ui.add(
+                        egui::Image::new(&self.texture)
+                            .maintain_aspect_ratio(true)
+                            .fit_to_exact_size(ui.available_size()),
+                    )
+                });
+            });
+            self.i += 1;
+            ctx.request_repaint();
+        });
+        self.armed = arm_state;
+        // info!("{}us", t.elapsed().unwrap().as_micros());
     }
 }
 
-#[cfg(target_os = "ios")]
-fn _start_app() {
-    stop_unwind(|| main());
-}
-
 #[no_mangle]
-#[inline(never)]
-#[cfg(target_os = "ios")]
-pub extern "C" fn start_app() {
-    _start_app();
-}
-
-#[cfg(not(target_os = "android"))]
-pub fn main() {
-    env_logger::builder()
-        .filter_level(log::LevelFilter::Warn)
-        .parse_default_env()
-        .init();
-
-    let event_loop = EventLoopBuilder::with_user_event().build();
-    _main(event_loop);
-}
-
-#[allow(dead_code)]
-#[cfg(target_os = "android")]
-#[no_mangle]
-fn android_main(app: AndroidApp) {
-    use winit::platform::android::EventLoopBuilderExtAndroid;
-
+pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
     android_logger::init_once(
-        android_logger::Config::default().with_max_level(log::LevelFilter::Warn),
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag(env!("CARGO_PKG_NAME")),
     );
+    tracing::subscriber::set_global_default(tracing_subscriber::FmtSubscriber::new())
+        .expect("setting tracing default failed");
 
-    let event_loop = EventLoopBuilder::with_user_event()
-        .with_android_app(app)
-        .build();
-    stop_unwind(|| _main(event_loop));
+    let network_interfaces = list_afinet_netifas().unwrap();
+
+    for (name, ip) in network_interfaces.iter() {
+        info!("{}:\t{:?}", name, ip);
+    }
+
+    let buffer = Arc::new(Mutex::new(DisplayData {
+        start_timestamp: SystemTime::now(),
+        image_data: make_debug_image(),
+        telemetry: Telemetry::zeroed(),
+        voltage_avg: 0.0,
+        recording: false,
+        actual_loop_time: 0.0,
+    }));
+    let buffer_cloned = buffer.clone();
+
+    let control = Arc::new(Mutex::new(Control::zeroed()));
+    let control_c = control.clone();
+    let tokio_thread = thread::spawn(move || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move { tokio_main(buffer_cloned, control_c).await.unwrap() })
+    });
+
+    eframe::run_native(
+        "My egui App",
+        eframe::NativeOptions {
+            event_loop_builder: Some(Box::new(|builder| {
+                builder.with_android_app(app);
+            })),
+            ..Default::default()
+        },
+        Box::new(|cc| Ok(Box::new(MyEguiApp::new(cc, buffer, control)))),
+    )
+    .unwrap();
+    tokio_thread.join().unwrap();
 }
+
+// use eframe::egui;
+// use winit::platform::android::EventLoopBuilderExtAndroid;
+
+// #[no_mangle]
+// fn android_main(app: winit::platform::android::activity::AndroidApp) {
+//     android_logger::init_once(
+//         android_logger::Config::default()
+//             .with_max_level(log::LevelFilter::Trace)
+//             .with_tag(env!("CARGO_PKG_NAME")),
+//     );
+
+//     eframe::run_native(
+//         "My egui App",
+//         eframe::NativeOptions {
+//             event_loop_builder: Some(Box::new(|builder| {
+//                 builder.with_android_app(app);
+//             })),
+//             ..Default::default()
+//         },
+//         Box::new(|cc| Ok(Box::new(MyEguiApp::new(cc)))),
+//     )
+//     .unwrap();
+// }
+
+// #[derive(Default)]
+// struct MyEguiApp {
+//     demo: egui_demo_lib::DemoWindows,
+// }
+
+// impl MyEguiApp {
+//     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+//         // Customize egui here with cc.egui_ctx.set_fonts and cc.egui_ctx.set_visuals.
+//         // Restore app state using cc.storage (requires the "persistence" feature).
+//         // Use the cc.gl (a glow::Context) to create graphics shaders and buffers that you can use
+//         // for e.g. egui::PaintCallback.
+//         Self::default()
+//     }
+// }
+
+// impl eframe::App for MyEguiApp {
+//     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+//         self.demo.ui(ctx);
+//     }
+// }

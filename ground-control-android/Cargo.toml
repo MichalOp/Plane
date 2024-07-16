@@ -21,18 +21,43 @@ app-plugins = [ "org.jetbrains.kotlin.android" ]
 app-theme-parent = "Theme.MaterialComponents.DayNight.DarkActionBar"
 
 [dependencies] 
-log = "0.4.14"
+# log = "0.4.14"
 chrono = "0.4"
-pollster = "0.2"
-egui = "0.22"
-wgpu = "0.16"
-winit = { version = "0.28", features = ["android-native-activity"] }
-egui_demo_lib = "0.22"
-egui-winit = { version = "0.22", default-features = false }
-egui-wgpu = { version = "0.22", features = [ "winit" ] }
+# pollster = "0.2"
+# egui = "0.22"
+# wgpu = "0.16"
+# winit = { version = "0.28", features = ["android-native-activity"] }
+# egui_demo_lib = "0.22"
+# egui-winit = { version = "0.22", default-features = false }
+# egui-wgpu = { version = "0.22", features = [ "winit" ] }
+# eframe = { version = "0.22", features = ["android-native-activity"]}
+tracing = { version = "0.1.40", features = ["log"] }
+tracing-subscriber = "0.3.18"
+protocol = { path = "../protocol"}
+bytemuck = "1.15.0"
+image = {version = "0.24", features = ["jpeg"]}
+anyhow = "1.0.82"
+# turbojpeg = { version = "1.1.0", features = ["image"] }
+stick = "0.13.0"
+tokio = { version = "1.37.0", features = ["full"] }
+ndarray = "0.15.6"
+nshare = "0.9.0"
+android_logger = "0.14.1"
+eframe = { path = "/home/michal/code/egui/crates/eframe", features = ["android-native-activity"]}
+egui_demo_lib = { path = "/home/michal/code/egui/crates/egui_demo_lib" }
+log = "0.4.21"
+winit = {version="0.30.3", features = ["android-native-activity"]}
+local-ip-address = "0.6.1"
+sscanf = "0.4.1"
+
+[patch.crates-io]
+winit = { path = "/home/michal/code/winit" }
 
 [target.'cfg(target_os = "android")'.dependencies]
-android_logger = "0.13.1"
+android_logger = "0.14.1"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 env_logger = "0.9"
+
+[profile.dev]
+opt-level = 3

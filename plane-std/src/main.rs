@@ -1,4 +1,5 @@
 #![feature(generic_arg_infer)]
+#![feature(ip_bits)]
 
 use anyhow::{bail, ensure, Result};
 use biquad::*;
@@ -16,14 +17,18 @@ use esp_idf_svc::{
         ledc::{config::TimerConfig, LedcTimerDriver},
         peripherals::Peripherals,
     },
+    handle::RawHandle,
     timer::EspTimerService,
 };
-use esp_idf_sys::{esp_wifi_get_max_tx_power, ets_get_cpu_frequency, nvs_flash_init, ESP_OK};
+use esp_idf_sys::{
+    esp_netif_dhcps_get_clients_by_mac, esp_wifi_ap_get_sta_list, esp_wifi_get_max_tx_power,
+    ets_get_cpu_frequency, nvs_flash_init, ESP_OK,
+};
 use lsm6dso;
 use pid::Pid;
 use protocol::{self, Control, Telemetry};
 use std::{
-    net::{SocketAddr, UdpSocket},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
     str::FromStr,
     sync::{atomic::AtomicU16, Arc, Mutex},
     thread::sleep,
@@ -32,6 +37,7 @@ use std::{
 
 mod wifi;
 use wifi::wifi;
+use wifi::wifi_ap;
 
 use itertools::izip;
 
@@ -114,7 +120,7 @@ impl Controller for QuadController<'_> {
         //     );
         // }
 
-        let yaw_flip = -1.0;
+        let yaw_flip = 1.0;
         let left_front = pitch + roll + yaw_flip * yaw;
         let left_back = -pitch + roll - yaw_flip * yaw;
         let right_front = pitch - roll - yaw_flip * yaw;
@@ -197,8 +203,8 @@ fn build_quad_controller<'a>(
         rates_zero,
         filters: [DirectForm2Transposed::<f32>::new(coeffs); 3],
         pids: [
-            *Pid::new(0.0, 1.0).p(4.0, 1.0).d(15.0, 1.0).i(0.1, 0.0),
-            *Pid::new(0.0, 1.0).p(4.0, 1.0).d(15.0, 1.0).i(0.1, 0.0),
+            *Pid::new(0.0, 1.0).p(5.0, 1.0).d(30.0, 1.0).i(0.1, 0.0),
+            *Pid::new(0.0, 1.0).p(5.0, 1.0).d(30.0, 1.0).i(0.1, 0.0),
             *Pid::new(0.0, 1.0).p(3.0, 1.0).d(1.0, 1.0).i(0.1, 0.0),
         ],
     };
@@ -224,21 +230,27 @@ fn build_plane_controller<'a>(
 
 fn command_thread(command: Arc<Mutex<protocol::Control>>, socket: Arc<UdpSocket>) -> Result<()> {
     println!("command thread started!");
-    socket
-        .set_read_timeout(Some(Duration::from_micros(2000)))
-        .unwrap();
+    // socket
+    //     .set_read_timeout(Some(Duration::from_micros(200000)))
+    //     .unwrap();
 
     let mut last_command_time = SystemTime::now();
     loop {
         let mut new_command = protocol::Control::zeroed();
         let buf = bytes_of_mut(&mut new_command);
+
+        // println!("receiving");
         let recv_value = socket.recv_from(buf);
         let ok = match recv_value {
             Ok((amt, _)) => amt == buf.len(),
-            _ => false,
+            Err(ee) => {
+                // println!("ee {}", ee);
+                false
+            }
         };
         let current_time = SystemTime::now();
         if ok {
+            // println!("{:?}", new_command);
             let mut locked = command.lock().unwrap();
             *locked = new_command;
             last_command_time = current_time;
@@ -360,12 +372,47 @@ fn main() -> Result<()> {
     };
 
     // Connect to the Wi-Fi network
-    let mut wifi = wifi(
+    let mut wifi = wifi_ap(
         app_config.wifi_ssid,
         app_config.wifi_psk,
         peripherals.modem,
         sysloop,
     )?;
+
+    println!("Wait for client to connect:");
+    let mut addr = None;
+    let netif = wifi.ap_netif_mut().handle();
+
+    while addr.is_none() {
+        let mut stations: esp_idf_sys::wifi_sta_list_t = Default::default();
+        let v = unsafe { esp_wifi_ap_get_sta_list(&mut stations) };
+        if v != ESP_OK {
+            continue;
+        }
+
+        if stations.num > 0 {
+            println!("mac {:x?}", stations.sta[0].mac);
+            let mut sta_ip_pair = esp_idf_sys::esp_netif_pair_mac_ip_t {
+                mac: stations.sta[0].mac,
+                ..Default::default()
+            };
+
+            sleep(Duration::from_millis(2000));
+            let v = unsafe { esp_netif_dhcps_get_clients_by_mac(netif, 1, &mut sta_ip_pair) };
+            if v != ESP_OK {
+                continue;
+            }
+            addr = Some(sta_ip_pair.ip);
+        }
+        sleep(Duration::from_millis(1000));
+    }
+
+    let flipped_addr = Ipv4Addr::from_bits(addr.unwrap().addr);
+    println!("flipped {:?}", flipped_addr);
+    let [a, b, c, d] = flipped_addr.octets();
+    let server = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(d, c, b, a)), 12892);
+    // let server = SocketAddr::from_str("192.168.16.54:12892")?;
+    println!("server {:?}", server);
 
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:12987")?);
 
@@ -445,8 +492,6 @@ fn main() -> Result<()> {
 
     timer.every(Duration::from_secs_f32(1.0 / 1660.0)).unwrap();
 
-    let server = SocketAddr::from_str("192.168.1.197:12892")?;
-    println!("server {:?}", server);
     let mut message_id = 0;
     unsafe {
         if esp_idf_sys::camera::esp_camera_init(&camera_config) != 0 {
@@ -498,12 +543,21 @@ fn main() -> Result<()> {
             continue;
         }
 
+        // let mut new_command = protocol::Control::zeroed();
+        // let buf = bytes_of_mut(&mut new_command);
+        // let recv_value = socket.recv_from(buf);
+        // println!("{:?}", new_command);
+
         let t3 = SystemTime::now();
 
         avg_capture += t2.duration_since(t1).unwrap_or_default().as_secs_f32();
         avg_send += t3.duration_since(t2).unwrap_or_default().as_secs_f32();
         if message_id % 100 == 0 {
-            signal_strength = driver.get_ap_info()?.signal_strength as i16;
+            let mut stations: esp_idf_sys::wifi_sta_list_t = Default::default();
+            let _v = unsafe { esp_wifi_ap_get_sta_list(&mut stations) };
+            if stations.num > 0 {
+                signal_strength = stations.sta[0].rssi as i16;
+            }
             let tnow = SystemTime::now();
             println!(
                 "id: {} capture: {} send: {} FPS: {}",
