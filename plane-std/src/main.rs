@@ -542,6 +542,7 @@ fn main() -> Result<()> {
             println!("Failed to send: {}", x);
             continue;
         }
+        // sleep(Duration::from_secs_f32(0.033));
 
         // let mut new_command = protocol::Control::zeroed();
         // let buf = bytes_of_mut(&mut new_command);
